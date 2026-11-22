@@ -1,8 +1,11 @@
 // ==UserScript==
-// @name         WDB Tool (step 0: logger + key test)
+// @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.2.0
-// @description  Practice/private rooms only. Logs positions of players and the ball to a downloadable file. Sends a key ONLY when you click a Test button.
+// @version      0.3.0
+// @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends a key ONLY when you click a Test button.
+// @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
+// @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
+// @downloadURL  https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
 // @match        https://bonk.io/gameframe-release.html*
 // @run-at       document-start
 // @grant        none
@@ -17,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.2.0';
+  var VERSION = '0.3.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -36,7 +39,9 @@
   // State (everything the tool remembers lives here)
   // ---------------------------------------------------------------
   var state = {
-    logging: false,   // the on/off switch for logging. Starts OFF on purpose.
+    logging: false,   // the RECORD switch. Starts OFF on purpose.
+    bot: false,       // the BOT switch. Nothing acts yet; it only shows in the panel.
+    keys: 0,          // how many of your own key events were recorded
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -146,7 +151,9 @@
       savedAt: d.toISOString(),
       ticks: state.ticks,
       tickFields: ['n', 't', 'b'],
-      bodyColumns: ['id', 'x', 'y', 'vx', 'vy', 'radius']
+      bodyColumns: ['id', 'x', 'y', 'vx', 'vy', 'radius'],
+      keyLines: 'k = down or up, code = physical key, n = last logged tick before the key event',
+      keys: state.keys
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -162,8 +169,29 @@
   function clearLog() {
     state.lines = [];
     state.ticks = 0;
+    state.keys = 0;
     state.error = '';
   }
+
+  // ---------------------------------------------------------------
+  // Your own key presses (real keyboard only, while RECORD is on)
+  // ---------------------------------------------------------------
+  function noteKey(type, e) {
+    if (!state.logging) return;
+    if (!e.isTrusted) return;   // ignore keys sent by this tool's own tests
+    if (e.repeat) return;       // ignore the keyboard's auto-repeat
+    var tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return; // never record typing in text boxes
+    state.keys++;
+    state.lines.push(JSON.stringify({
+      k: type,
+      code: e.code,
+      n: state.ticks,
+      t: Math.round(performance.now() * 10) / 10
+    }));
+  }
+  window.addEventListener('keydown', function (e) { noteKey('down', e); }, true);
+  window.addEventListener('keyup', function (e) { noteKey('up', e); }, true);
 
   // ---------------------------------------------------------------
   // Key test: press ONE key when you click a Test button, then
@@ -271,15 +299,23 @@
     title.textContent = 'WDB TOOL ' + VERSION + ' (keys sent only when you click a Test button)';
     title.style.cssText = 'font-weight:bold;margin-bottom:4px';
 
-    ui.badge = document.createElement('div');
-    ui.badge.style.cssText = 'font-size:14px;font-weight:bold;padding:2px 6px;border-radius:4px;display:inline-block';
+    var badges = document.createElement('div');
+    ui.botBadge = document.createElement('span');
+    ui.recBadge = document.createElement('span');
+    [ui.botBadge, ui.recBadge].forEach(function (el) {
+      el.style.cssText = 'font-size:14px;font-weight:bold;padding:2px 6px;border-radius:4px;' +
+                         'display:inline-block;margin-right:6px';
+      badges.appendChild(el);
+    });
 
     ui.info = document.createElement('div');
     ui.info.style.cssText = 'margin-top:4px;white-space:pre';
 
     var row1 = document.createElement('div');
-    ui.toggle = makeButton('', function () { setLogging(!state.logging); });
-    row1.appendChild(ui.toggle);
+    ui.botToggle = makeButton('', function () { state.bot = !state.bot; refreshPanel(); });
+    ui.recToggle = makeButton('', function () { setLogging(!state.logging); });
+    row1.appendChild(ui.botToggle);
+    row1.appendChild(ui.recToggle);
     row1.appendChild(makeButton('Download log', downloadLog));
     row1.appendChild(makeButton('Clear', clearLog));
 
@@ -296,7 +332,7 @@
     ui.result.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#ffd866';
 
     box.appendChild(title);
-    box.appendChild(ui.badge);
+    box.appendChild(badges);
     box.appendChild(ui.info);
     box.appendChild(row1);
     box.appendChild(row2);
@@ -308,15 +344,19 @@
   var lastTicks = 0, lastTime = 0, rate = 0;
 
   function refreshPanel() {
-    if (!ui.badge) return;
-    ui.badge.textContent = state.logging ? 'LOGGING ON' : 'LOGGING OFF';
-    ui.badge.style.background = state.logging ? '#b00020' : '#444';
-    ui.toggle.textContent = state.logging ? 'Turn OFF' : 'Turn ON';
+    if (!ui.botBadge) return;
+    ui.botBadge.textContent = state.bot ? 'BOT ON' : 'BOT OFF';
+    ui.botBadge.style.background = state.bot ? '#1b7f3a' : '#444';
+    ui.recBadge.textContent = state.logging ? 'RECORD ON' : 'RECORD OFF';
+    ui.recBadge.style.background = state.logging ? '#b00020' : '#444';
+    ui.botToggle.textContent = state.bot ? 'Bot: turn OFF' : 'Bot: turn ON';
+    ui.recToggle.textContent = state.logging ? 'Record: turn OFF' : 'Record: turn ON';
     ui.target.textContent = 'Key target: ' + targetMode;
     var status = state.hooked ? 'attached to game physics' : 'waiting for the game to load...';
     ui.info.textContent =
       status + '\n' +
-      'ticks logged: ' + state.ticks + '   rate: ' + rate.toFixed(1) + '/s' +
+      'ticks logged: ' + state.ticks + '   rate: ' + rate.toFixed(1) + '/s   keys recorded: ' + state.keys +
+      (state.bot ? '\nBOT is ON but has no actions built yet' : '') +
       (state.error ? '\n' + state.error : '');
     ui.result.textContent = state.result;
   }
