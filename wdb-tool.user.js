@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.3.0
+// @version      0.4.0
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends a key ONLY when you click a Test button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -267,6 +267,93 @@
   }
 
   // ---------------------------------------------------------------
+  // Bounce report: how bouncy is each surface? Works on the log in
+  // memory, so click it BEFORE you reload the page or press Clear.
+  // ---------------------------------------------------------------
+  var BALL_ID = 4;               // the ball's tag (it was id 4 in every log so far)
+  var ARENA_OBJECT_ID = 6;       // the big arena object, not a player
+  var GRAVITY_PER_TICK = 0.333;  // measured: the ball gains this much downward speed per tick
+
+  function findBody(tick, id) {
+    for (var i = 0; i < tick.b.length; i++) {
+      if (tick.b[i][0] === id) return tick.b[i];
+    }
+    return null;
+  }
+
+  // True if any player is close enough to the ball to have touched it.
+  function playerNear(tick, ball) {
+    for (var i = 0; i < tick.b.length; i++) {
+      var o = tick.b[i];
+      if (o[0] === BALL_ID || o[0] === ARENA_OBJECT_ID) continue;
+      var reach = (o[5] || 1) + (ball[5] || 1) + 0.6;
+      if (Math.hypot(o[1] - ball[1], o[2] - ball[2]) < reach) return true;
+    }
+    return false;
+  }
+
+  function median(sorted) {
+    var m = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+  }
+
+  function analyseBounces(lines) {
+    var ticks = [];
+    for (var i = 0; i < lines.length; i++) {
+      var o;
+      try { o = JSON.parse(lines[i]); } catch (e) { continue; }
+      if (o && o.b) ticks.push(o);   // skip key lines
+    }
+    var ratios = { 'floor/bump': [], 'ceiling': [], 'left wall': [], 'right wall': [] };
+    var other = 0, nearPlayer = 0;
+
+    for (var j = 1; j < ticks.length; j++) {
+      var a = ticks[j - 1], c = ticks[j];
+      if (c.n !== a.n + 1 || c.t - a.t > 200) continue;  // only back-to-back ticks
+      var b0 = findBody(a, BALL_ID), b1 = findBody(c, BALL_ID);
+      if (!b0 || !b1) continue;
+      // Speed just before the hit = last tick's speed plus this tick's gravity.
+      var vx0 = b0[3], vy0 = b0[4] + GRAVITY_PER_TICK;
+      var vx1 = b1[3], vy1 = b1[4];
+      if (Math.abs(vx1 - vx0) < 1.5 && Math.abs(vy1 - vy0) < 1.5) continue; // no sudden change: not a hit
+      if (playerNear(a, b0) || playerNear(c, b1)) { nearPlayer++; continue; }
+
+      var x = b1[1], y = b1[2];
+      var flippedY = (vy0 > 3 && vy1 < 0) || (vy0 < -3 && vy1 > 0);
+      var flippedX = (vx0 > 3 && vx1 < 0) || (vx0 < -3 && vx1 > 0);
+      var inside = x > 2.5 && x < 58.3;   // inside the arena, not down in a net
+      if (flippedY && inside && Math.abs(vy1 - vy0) >= Math.abs(vx1 - vx0)) {
+        ratios[y > 20.8 ? 'floor/bump' : 'ceiling'].push(-vy1 / vy0);
+      } else if (flippedX && y < 27) {
+        ratios[x < 30.4 ? 'left wall' : 'right wall'].push(-vx1 / vx0);
+      } else {
+        other++;
+      }
+    }
+
+    var out = ['Bounce report (ball; bounce = speed after / speed before):'];
+    var any = false;
+    Object.keys(ratios).forEach(function (name) {
+      var r = ratios[name].slice().sort(function (p, q) { return p - q; });
+      if (!r.length) { out.push(name + ': no clean hits found'); return; }
+      any = true;
+      var lo = r[Math.floor(r.length * 0.25)];
+      var hi = r[Math.min(r.length - 1, Math.floor(r.length * 0.75))];
+      out.push(name + ': ' + r.length + ' hits, median ' + median(r).toFixed(2) +
+               ' (middle half ' + lo.toFixed(2) + ' to ' + hi.toFixed(2) + ')');
+    });
+    out.push('skipped: ' + nearPlayer + ' hits near a player, ' + other + ' elsewhere');
+    if (!any) out.push('Hit the ball into the floor, walls and ceiling while RECORD is on, then try again.');
+    return out.join('\n');
+  }
+
+  function runBounceReport() {
+    state.result = analyseBounces(state.lines);
+    refreshPanel();
+  }
+  window.__wdbTool.analyseBounces = analyseBounces;
+
+  // ---------------------------------------------------------------
   // Panel (the visible switch and buttons)
   // ---------------------------------------------------------------
   var ui = {};
@@ -327,6 +414,7 @@
       refreshPanel();
     });
     row2.appendChild(ui.target);
+    row2.appendChild(makeButton('Bounce report', runBounceReport));
 
     ui.result = document.createElement('div');
     ui.result.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#ffd866';
