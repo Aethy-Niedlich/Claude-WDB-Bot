@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.4.0
+// @version      0.5.0
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends a key ONLY when you click a Test button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.4.0';
+  var VERSION = '0.5.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -42,6 +42,7 @@
     logging: false,   // the RECORD switch. Starts OFF on purpose.
     bot: false,       // the BOT switch. Nothing acts yet; it only shows in the panel.
     keys: 0,          // how many of your own key events were recorded
+    attachedTicks: 0, // how many logged ticks had a rope (grapple) on the ball
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -96,6 +97,30 @@
     return bodies;
   }
 
+  // Reads the ropes (grapples) in the world. Returns a list of
+  // [type, bodyA id, bodyB id, rope length]. The permanent joint that pins the
+  // arena object to the world (it touches the "ground" body, id -1) is left out.
+  function idOfBody(body) {
+    var tag = body.GetUserData();
+    return tag && tag.arrayID !== undefined ? tag.arrayID : -9;
+  }
+
+  function readJoints(world) {
+    var list = [];
+    try {
+      for (var j = world.GetJointList(); j; j = j.GetNext()) {
+        var a = idOfBody(j.GetBodyA()), b = idOfBody(j.GetBodyB());
+        if (a === -1 || b === -1) continue;
+        var len = null;
+        try { len = round3(j.GetLength()); } catch (e) { /* not every joint has a length */ }
+        list.push([j.GetType(), a, b, len]);
+      }
+    } catch (e) {
+      state.error = 'cannot read ropes: ' + e.message;
+    }
+    return list;
+  }
+
   function installHook(physics) {
     var proto = physics.Dynamics.b2World.prototype;
     var original = proto.Step;
@@ -104,7 +129,8 @@
       if (state.logging || test) {
         try {
           var bodies = readBodies(this);
-          if (state.logging) logTick(bodies);
+          var joints = readJoints(this);
+          if (state.logging) logTick(bodies, joints);
           if (test) updateTest(bodies);
         } catch (e) { state.error = 'read error: ' + e.message; }
       }
@@ -125,18 +151,17 @@
   // ---------------------------------------------------------------
   // Log file
   // ---------------------------------------------------------------
-  function logTick(bodies) {
+  function logTick(bodies, joints) {
     if (state.ticks >= MAX_TICKS) {
       setLogging(false);
       state.error = 'Size limit reached, logging stopped. Download the log.';
       return;
     }
     state.ticks++;
-    state.lines.push(JSON.stringify({
-      n: state.ticks,
-      t: Math.round(performance.now() * 10) / 10,
-      b: bodies
-    }));
+    var line = { n: state.ticks, t: Math.round(performance.now() * 10) / 10, b: bodies };
+    if (joints.length) line.j = joints;      // only present while a rope exists
+    if (ballIsAttached(line)) state.attachedTicks++;
+    state.lines.push(JSON.stringify(line));
   }
 
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -153,6 +178,7 @@
       tickFields: ['n', 't', 'b'],
       bodyColumns: ['id', 'x', 'y', 'vx', 'vy', 'radius'],
       keyLines: 'k = down or up, code = physical key, n = last logged tick before the key event',
+      ropeField: 'j = ropes (grapples), each [type, bodyA id, bodyB id, rope length]; only present while a rope exists',
       keys: state.keys
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
@@ -170,6 +196,7 @@
     state.lines = [];
     state.ticks = 0;
     state.keys = 0;
+    state.attachedTicks = 0;
     state.error = '';
   }
 
@@ -274,6 +301,15 @@
   var ARENA_OBJECT_ID = 6;       // the big arena object, not a player
   var GRAVITY_PER_TICK = 0.333;  // measured: the ball gains this much downward speed per tick
 
+  // True if a rope (grapple) is attached to the ball in this tick.
+  function ballIsAttached(tick) {
+    if (!tick.j) return false;
+    for (var i = 0; i < tick.j.length; i++) {
+      if (tick.j[i][1] === BALL_ID || tick.j[i][2] === BALL_ID) return true;
+    }
+    return false;
+  }
+
   function findBody(tick, id) {
     for (var i = 0; i < tick.b.length; i++) {
       if (tick.b[i][0] === id) return tick.b[i];
@@ -305,7 +341,7 @@
       if (o && o.b) ticks.push(o);   // skip key lines
     }
     var ratios = { 'floor/bump': [], 'ceiling': [], 'left wall': [], 'right wall': [] };
-    var other = 0, nearPlayer = 0;
+    var other = 0, nearPlayer = 0, roped = 0;
 
     for (var j = 1; j < ticks.length; j++) {
       var a = ticks[j - 1], c = ticks[j];
@@ -316,6 +352,7 @@
       var vx0 = b0[3], vy0 = b0[4] + GRAVITY_PER_TICK;
       var vx1 = b1[3], vy1 = b1[4];
       if (Math.abs(vx1 - vx0) < 1.5 && Math.abs(vy1 - vy0) < 1.5) continue; // no sudden change: not a hit
+      if (ballIsAttached(a) || ballIsAttached(c)) { roped++; continue; }  // a rope is pulling: not a bounce
       if (playerNear(a, b0) || playerNear(c, b1)) { nearPlayer++; continue; }
 
       var x = b1[1], y = b1[2];
@@ -342,7 +379,7 @@
       out.push(name + ': ' + r.length + ' hits, median ' + median(r).toFixed(2) +
                ' (middle half ' + lo.toFixed(2) + ' to ' + hi.toFixed(2) + ')');
     });
-    out.push('skipped: ' + nearPlayer + ' hits near a player, ' + other + ' elsewhere');
+    out.push('skipped: ' + roped + ' while on a rope, ' + nearPlayer + ' near a player, ' + other + ' elsewhere');
     if (!any) out.push('Hit the ball into the floor, walls and ceiling while RECORD is on, then try again.');
     return out.join('\n');
   }
@@ -443,7 +480,8 @@
     var status = state.hooked ? 'attached to game physics' : 'waiting for the game to load...';
     ui.info.textContent =
       status + '\n' +
-      'ticks logged: ' + state.ticks + '   rate: ' + rate.toFixed(1) + '/s   keys recorded: ' + state.keys +
+      'ticks logged: ' + state.ticks + '   rate: ' + rate.toFixed(1) + '/s   keys recorded: ' + state.keys + '\n' +
+      'ticks with a rope on the ball: ' + state.attachedTicks +
       (state.bot ? '\nBOT is ON but has no actions built yet' : '') +
       (state.error ? '\n' + state.error : '');
     ui.result.textContent = state.result;
