@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.5.0
+// @version      0.6.0
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends a key ONLY when you click a Test button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.5.0';
+  var VERSION = '0.6.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -43,6 +43,7 @@
     bot: false,       // the BOT switch. Nothing acts yet; it only shows in the panel.
     keys: 0,          // how many of your own key events were recorded
     attachedTicks: 0, // how many logged ticks had a rope (grapple) on the ball
+    score: { n: 0, within1: 0, within2: 0, within4: 0, errs: [] }, // live self-score of the ball predictor
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -130,7 +131,7 @@
         try {
           var bodies = readBodies(this);
           var joints = readJoints(this);
-          if (state.logging) logTick(bodies, joints);
+          if (state.logging) { logTick(bodies, joints); scoreTick(bodies, joints); }
           if (test) updateTest(bodies);
         } catch (e) { state.error = 'read error: ' + e.message; }
       }
@@ -179,7 +180,8 @@
       bodyColumns: ['id', 'x', 'y', 'vx', 'vy', 'radius'],
       keyLines: 'k = down or up, code = physical key, n = last logged tick before the key event',
       ropeField: 'j = ropes (grapples), each [type, bodyA id, bodyB id, rope length]; only present while a rope exists',
-      keys: state.keys
+      keys: state.keys,
+      predictorScore: scoreSummary()
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -198,6 +200,7 @@
     state.keys = 0;
     state.attachedTicks = 0;
     state.error = '';
+    resetScore();
   }
 
   // ---------------------------------------------------------------
@@ -294,12 +297,93 @@
   }
 
   // ---------------------------------------------------------------
-  // Bounce report: how bouncy is each surface? Works on the log in
-  // memory, so click it BEFORE you reload the page or press Clear.
+  // Ball model and live self-score.
+  // While the ball is free (no rope on it), it falls with constant gravity,
+  // and when it touches a wall, the ceiling or the floor it stops in that
+  // direction and keeps sliding along the surface at the same speed.
+  // Measured from recordings; the numbers below come from the arena shape.
   // ---------------------------------------------------------------
   var BALL_ID = 4;               // the ball's tag (it was id 4 in every log so far)
   var ARENA_OBJECT_ID = 6;       // the big arena object, not a player
-  var GRAVITY_PER_TICK = 0.333;  // measured: the ball gains this much downward speed per tick
+  var GRAVITY_PER_TICK = 0.3333; // measured: the ball gains this much downward speed per tick
+  var TICK_SECONDS = 1 / 30;     // measured: one physics tick is 1/30 of a second
+  var PREDICT_TICKS = 15;        // half a second ahead
+  var WALL_LEFT = 2.917, WALL_RIGHT = 57.917;   // where the ball's centre stops at a side wall
+  var CEILING_Y = 1.458, FLOOR_Y = 38.54;       // where the ball's centre stops at the ceiling / floor
+  var NET_TOP_Y = 27.04;                        // below this height the side walls are open (the nets)
+
+  // Where will the ball be after `steps` ticks, if nobody touches it?
+  function predictBall(x, y, vx, vy, steps) {
+    for (var i = 0; i < steps; i++) {
+      vy += GRAVITY_PER_TICK;
+      var nx = x + vx * TICK_SECONDS, ny = y + vy * TICK_SECONDS;
+      if (ny > FLOOR_Y) { ny = FLOOR_Y; vy = 0; }
+      else if (ny < CEILING_Y) { ny = CEILING_Y; vy = 0; }
+      if (ny < NET_TOP_Y) {
+        if (nx > WALL_RIGHT) { nx = WALL_RIGHT; vx = 0; }
+        else if (nx < WALL_LEFT) { nx = WALL_LEFT; vx = 0; }
+      }
+      x = nx; y = ny;
+    }
+    return [x, y];
+  }
+
+  // Self-score: one prediction at a time. When the half second is up, compare with
+  // where the ball really is. Only counts moments where the ball is free, inside the
+  // arena and moving; any rope, nearby player or pause cancels the prediction.
+  var pending = null, lastScoreTime = 0, scoreSeq = 0;
+
+  function resetScore() {
+    state.score = { n: 0, within1: 0, within2: 0, within4: 0, errs: [] };
+    pending = null;
+  }
+
+  function recordScore(err) {
+    var sc = state.score;
+    sc.n++;
+    if (err <= 1) sc.within1++;
+    if (err <= 2) sc.within2++;
+    if (err <= 4) sc.within4++;
+    sc.errs.push(err);
+    if (sc.errs.length > 5000) sc.errs.shift();
+  }
+
+  function scoreTick(bodies, joints) {
+    var now = performance.now();
+    if (lastScoreTime && now - lastScoreTime > 200) pending = null; // a pause: start over
+    lastScoreTime = now;
+    scoreSeq++;
+    var tick = { b: bodies, j: joints };
+    var ball = findBody(tick, BALL_ID);
+    var valid = ball && !ballIsAttached(tick) && !playerNear(tick, ball) && ball[1] > 1.9 && ball[1] < 58.9;
+    if (!valid) { pending = null; return; }
+    if (pending && scoreSeq === pending.due) {
+      recordScore(Math.hypot(pending.x - ball[1], pending.y - ball[2]));
+      pending = null;
+    }
+    if (!pending && Math.hypot(ball[3], ball[4]) > 3) {
+      var p = predictBall(ball[1], ball[2], ball[3], ball[4], PREDICT_TICKS);
+      pending = { due: scoreSeq + PREDICT_TICKS, x: p[0], y: p[1] };
+    }
+  }
+
+  function scoreSummary() {
+    var sc = state.score;
+    if (!sc.n) return 'predictor (0.5 s ahead): nothing scored yet';
+    var sorted = sc.errs.slice().sort(function (p, q) { return p - q; });
+    var med = sorted[Math.floor(sorted.length / 2)];
+    function pct(k) { return Math.round(100 * k / sc.n) + '%'; }
+    var verdict = sc.n < 100 ? 'need 100+ scored (' + sc.n + ' so far)'
+                : (sc.within2 / sc.n >= 0.9 ? 'MET' : 'NOT MET');
+    return 'predictor (0.5 s ahead): ' + sc.n + ' scored, median error ' + med.toFixed(2) + '\n' +
+           'within 1 / 2 / 4 units: ' + pct(sc.within1) + ' / ' + pct(sc.within2) + ' / ' + pct(sc.within4) + '\n' +
+           'target (2 units, 9 in 10): ' + verdict;
+  }
+
+  // ---------------------------------------------------------------
+  // Bounce report: how bouncy is each surface? Works on the log in
+  // memory, so click it BEFORE you reload the page or press Clear.
+  // ---------------------------------------------------------------
 
   // True if a rope (grapple) is attached to the ball in this tick.
   function ballIsAttached(tick) {
@@ -481,7 +565,8 @@
     ui.info.textContent =
       status + '\n' +
       'ticks logged: ' + state.ticks + '   rate: ' + rate.toFixed(1) + '/s   keys recorded: ' + state.keys + '\n' +
-      'ticks with a rope on the ball: ' + state.attachedTicks +
+      'ticks with a rope on the ball: ' + state.attachedTicks + '\n' +
+      scoreSummary() +
       (state.bot ? '\nBOT is ON but has no actions built yet' : '') +
       (state.error ? '\n' + state.error : '');
     ui.result.textContent = state.result;
