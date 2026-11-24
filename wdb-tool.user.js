@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.0
+// @version      0.7.1
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.0';
+  var VERSION = '0.7.1';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -488,19 +488,51 @@
   var LAB_TRIALS = 10;              // trials per button click
   var LAB_WATCH_TICKS = 45;         // each trial is watched for 1.5 seconds after the action starts
   var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
-  var labSettings = { tapIndex: 1, holdSideways: false };
+  var labSettings = { tapIndex: 1, holdSideways: false, heavyOffset: -1 };  // heavy goes 1 tick before (-1) or after (+1) the grapple
   var lab = null;                   // set while the lab is running
   var labNote = '';
 
   // Each action is a list of [tick, key, 'down' or 'up'], counted from the action start.
+  // n = how many ticks the keys are held; off = where heavy goes relative to the grapple (-1 = a tick
+  // before, +1 = a tick after). Heavy is never pressed on the very same tick as the grapple, because
+  // the game sometimes ignores the grapple then.
   var ACTIONS = {
     'T':         function (n) { return [[0, 't', 'down'], [n, 't', 'up']]; },
     'W+T':       function (n) { return [[0, 'up', 'down'], [0, 't', 'down'], [n, 'up', 'up'], [n, 't', 'up']]; },
-    'Space+T':   function (n) { return [[0, 'space', 'down'], [0, 't', 'down'], [n, 'space', 'up'], [n, 't', 'up']]; },
-    'W+Space+T': function (n) { return [[0, 'up', 'down'], [0, 'space', 'down'], [0, 't', 'down'],
-                                        [n, 'up', 'up'], [n, 'space', 'up'], [n, 't', 'up']]; },
+    'Space+T':   function (n, off) { return [[0, 't', 'down'], [n, 't', 'up'], [off, 'space', 'down'], [off + n, 'space', 'up']]; },
+    'W+Space+T': function (n, off) { return [[0, 'up', 'down'], [n, 'up', 'up'], [0, 't', 'down'], [n, 't', 'up'],
+                                             [off, 'space', 'down'], [off + n, 'space', 'up']]; },
     'W then T':  function (n) { return [[0, 'up', 'down'], [2, 'up', 'up'], [2, 't', 'down'], [2 + n, 't', 'up']]; }
   };
+
+  // Shift an action so its earliest key event is at tick 0.
+  function labNormalise(events) {
+    var first = Math.min.apply(null, events.map(function (e) { return e[0]; }));
+    return events.map(function (e) { return [e[0] - first, e[1], e[2]]; });
+  }
+
+  // Which way can the "Run first" run go? Prefer towards the middle, but never towards the ball
+  // and never into a wall. Returns 'left', 'right' or null.
+  function labPickDirection(x, ballX) {
+    var span = 10, order = x > 30.4 ? ['left', 'right'] : ['right', 'left'];
+    for (var i = 0; i < order.length; i++) {
+      var sign = order[i] === 'right' ? 1 : -1, end = x + sign * span;
+      var wallOk = end > 4 && end < 57;
+      var ballOk = ballX === null || ballX < Math.min(x, end) - 3 || ballX > Math.max(x, end) + 3;
+      if (wallOk && ballOk) return order[i];
+    }
+    return null;
+  }
+
+  // Steers back to where you stood when the lab started, and stops there.
+  // Returns the direction key to hold ('left', 'right') or null. (Acceleration is about 12.8 units/s^2.)
+  function labHomeKey(me) {
+    var stopDistance = me[3] * Math.abs(me[3]) / 25.6;   // how far you would still slide if you braked now
+    var err = lab.homeX - (me[1] + stopDistance);
+    if (err > 0.3) return 'right';
+    if (err < -0.3) return 'left';
+    return null;
+  }
 
   function labPress(keyName, type) {
     lab.held[keyName] = (type === 'down');
@@ -529,7 +561,7 @@
     if (!state.hooked) { labNote = 'Not attached to the game yet.'; refreshPanel(); return; }
     lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
-            brake: null, dirSign: 1 };
+            brake: null, dirSign: 1, homeX: null };
     labNote = '';
     refreshPanel();
   }
@@ -542,17 +574,26 @@
     refreshPanel();
   }
 
-  function labBeginTrial(me) {
+  function labBeginTrial(me, ball) {
     labBrake(null);
-    var dir = me[1] > 30.4 ? 'left' : 'right';   // run towards the middle so you never hit a wall
+    var dir = null;
+    if (lab.sideways) {
+      dir = labPickDirection(me[1], ball ? ball[1] : null);
+      if (!dir) {
+        stopLab('Run first needs about 10 units of open floor to run on, away from the ball and the walls. Move to another spot and try again.');
+        return;
+      }
+    }
     var runup = lab.sideways ? LAB_RUNUP_TICKS : 0;
-    var events = ACTIONS[lab.action](lab.tap).map(function (e) { return [e[0] + runup, e[1], e[2]]; });
+    var events = labNormalise(ACTIONS[lab.action](lab.tap, labSettings.heavyOffset))
+                   .map(function (e) { return [e[0] + runup, e[1], e[2]]; });
     if (lab.sideways) events.unshift([0, dir, 'down']);
     lab.stage = 'running';
     lab.t = 0;
     lab.events = events;
     lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
+                  off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
                   x0: me[1], y0: me[2], minY: me[2], air: 0, ropeTicks: 0,
                   ropeLen: null, ropeTarget: null, xEnd: me[1] };
   }
@@ -560,7 +601,7 @@
   function labFinishTrial() {
     var tr = lab.trial;
     labReleaseAll();
-    state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways,
+    state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways, heavy: tr.off, x0: round3(tr.x0),
       rise: round3(tr.y0 - tr.minY), air: tr.air, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
@@ -582,6 +623,11 @@
     }
     var me = players[0];
     var ball = findBody({ b: bodies }, BALL_ID);
+    if (lab.homeX === null) lab.homeX = me[1];   // "home" = where you stood when the lab started
+    if (ball && Math.hypot(me[1] - ball[1], me[2] - ball[2]) < 5) {
+      stopLab('Lab stopped: you got within 5 units of the ball.');
+      return;
+    }
 
     if (lab.stage === 'waiting' || lab.stage === 'gap') {
       lab.waited++;
@@ -590,11 +636,11 @@
         lab.stage = 'waiting';
         lab.waited = 0;
       }
-      labBrake(me[3] > 0.5 ? 'left' : (me[3] < -0.5 ? 'right' : null));
-      var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5;
+      labBrake(labHomeKey(me));   // between trials, walk back to where you started
+      var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5 && Math.abs(me[1] - lab.homeX) < 1.0;
       var far = !ball || Math.hypot(me[1] - ball[1], me[2] - ball[2]) > 8;
-      if (calm && far) labBeginTrial(me);
-      else if (lab.waited > 300) stopLab('Lab stopped: no calm start in 10 seconds (stand on the flat floor, away from the ball).');
+      if (calm && far) labBeginTrial(me, ball);
+      else if (lab.waited > 300) stopLab('Lab stopped: no calm start at your starting spot in 10 seconds (stand on the flat floor, away from the ball).');
       return;
     }
 
@@ -622,7 +668,8 @@
   function labSummary() {
     var groups = {}, order = [];
     state.labTrials.forEach(function (r) {
-      var key = r.action + ' (tap ' + r.tap + (r.sideways ? ', running' : '') + ')';
+      var key = r.action + ' (tap ' + r.tap + (r.heavy ? ', heavy ' + (r.heavy < 0 ? 'first' : 'second') : '') +
+                (r.sideways ? ', running' : '') + ')';
       if (!groups[key]) { groups[key] = []; order.push(key); }
       groups[key].push(r);
     });
@@ -733,8 +780,13 @@
       labSettings.holdSideways = !labSettings.holdSideways;
       refreshPanel();
     });
+    ui.labHeavy = makeButton('', function () {
+      labSettings.heavyOffset = labSettings.heavyOffset < 0 ? 1 : -1;
+      refreshPanel();
+    });
     row4.appendChild(ui.labTap);
     row4.appendChild(ui.labRun);
+    row4.appendChild(ui.labHeavy);
     row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
 
     ui.result = document.createElement('div');
@@ -766,6 +818,7 @@
     ui.target.textContent = 'Key target: ' + targetMode;
     ui.labTap.textContent = 'Keys held: ' + TAP_CHOICES[labSettings.tapIndex] + ' ticks';
     ui.labRun.textContent = 'Run first: ' + (labSettings.holdSideways ? 'on' : 'off');
+    ui.labHeavy.textContent = 'Heavy: ' + (labSettings.heavyOffset < 0 ? '1 tick before' : '1 tick after') + ' grapple';
     var status = state.hooked ? 'attached to game physics' : 'waiting for the game to load...';
     ui.info.textContent =
       status + '\n' +
