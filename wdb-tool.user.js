@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.6.0
-// @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends a key ONLY when you click a Test button.
+// @version      0.7.0
+// @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
 // @downloadURL  https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.6.0';
+  var VERSION = '0.7.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -44,6 +44,7 @@
     keys: 0,          // how many of your own key events were recorded
     attachedTicks: 0, // how many logged ticks had a rope (grapple) on the ball
     score: { n: 0, within1: 0, within2: 0, within4: 0, errs: [] }, // live self-score of the ball predictor
+    labTrials: [],    // finished control-lab trials (saved in the log's first line)
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -127,12 +128,13 @@
     var original = proto.Step;
     proto.Step = function () {
       var result = original.apply(this, arguments); // let the game do its normal work first
-      if (state.logging || test) {
+      if (state.logging || test || lab) {
         try {
           var bodies = readBodies(this);
           var joints = readJoints(this);
           if (state.logging) { logTick(bodies, joints); scoreTick(bodies, joints); }
           if (test) updateTest(bodies);
+          if (lab) labTick(bodies, joints);
         } catch (e) { state.error = 'read error: ' + e.message; }
       }
       return result;
@@ -181,7 +183,8 @@
       keyLines: 'k = down or up, code = physical key, n = last logged tick before the key event',
       ropeField: 'j = ropes (grapples), each [type, bodyA id, bodyB id, rope length]; only present while a rope exists',
       keys: state.keys,
-      predictorScore: scoreSummary()
+      predictorScore: scoreSummary(),
+      labTrials: state.labTrials
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -201,6 +204,7 @@
     state.attachedTicks = 0;
     state.error = '';
     resetScore();
+    state.labTrials = [];
   }
 
   // ---------------------------------------------------------------
@@ -475,6 +479,182 @@
   window.__wdbTool.analyseBounces = analyseBounces;
 
   // ---------------------------------------------------------------
+  // Control lab: do one named action many times and measure what it does.
+  // It only runs when you click a Lab button, in a SOLO room. Key presses
+  // are timed in game ticks (not browser timers), and every key it pressed
+  // is released when it finishes or when you click Stop lab.
+  // ---------------------------------------------------------------
+  var TAP_CHOICES = [2, 3, 5, 8];   // how many ticks the keys are held (30 ticks = 1 second)
+  var LAB_TRIALS = 10;              // trials per button click
+  var LAB_WATCH_TICKS = 45;         // each trial is watched for 1.5 seconds after the action starts
+  var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
+  var labSettings = { tapIndex: 1, holdSideways: false };
+  var lab = null;                   // set while the lab is running
+  var labNote = '';
+
+  // Each action is a list of [tick, key, 'down' or 'up'], counted from the action start.
+  var ACTIONS = {
+    'T':         function (n) { return [[0, 't', 'down'], [n, 't', 'up']]; },
+    'W+T':       function (n) { return [[0, 'up', 'down'], [0, 't', 'down'], [n, 'up', 'up'], [n, 't', 'up']]; },
+    'Space+T':   function (n) { return [[0, 'space', 'down'], [0, 't', 'down'], [n, 'space', 'up'], [n, 't', 'up']]; },
+    'W+Space+T': function (n) { return [[0, 'up', 'down'], [0, 'space', 'down'], [0, 't', 'down'],
+                                        [n, 'up', 'up'], [n, 'space', 'up'], [n, 't', 'up']]; },
+    'W then T':  function (n) { return [[0, 'up', 'down'], [2, 'up', 'up'], [2, 't', 'down'], [2 + n, 't', 'up']]; }
+  };
+
+  function labPress(keyName, type) {
+    lab.held[keyName] = (type === 'down');
+    try { sendKey(KEYS[keyName], type === 'down' ? 'keydown' : 'keyup'); }
+    catch (e) { state.error = 'key error: ' + e.message; }
+    if (state.logging) {   // marked "bot" so it is never mistaken for your own key presses
+      state.lines.push(JSON.stringify({ k: type, code: KEYS[keyName].code, n: state.ticks,
+                                        t: Math.round(performance.now() * 10) / 10, bot: 1 }));
+    }
+  }
+
+  function labReleaseAll() {
+    if (!lab) return;
+    Object.keys(lab.held).forEach(function (name) { if (lab.held[name]) labPress(name, 'up'); });
+  }
+
+  function labBrake(want) {   // want: 'left', 'right' or null; slows you down between trials
+    if (lab.brake === want) return;
+    if (lab.brake) labPress(lab.brake, 'up');
+    if (want) labPress(want, 'down');
+    lab.brake = want;
+  }
+
+  function startLab(name) {
+    if (lab) return;
+    if (!state.hooked) { labNote = 'Not attached to the game yet.'; refreshPanel(); return; }
+    lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
+            stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
+            brake: null, dirSign: 1 };
+    labNote = '';
+    refreshPanel();
+  }
+
+  function stopLab(message) {
+    if (!lab) return;
+    labReleaseAll();
+    lab = null;
+    labNote = message;
+    refreshPanel();
+  }
+
+  function labBeginTrial(me) {
+    labBrake(null);
+    var dir = me[1] > 30.4 ? 'left' : 'right';   // run towards the middle so you never hit a wall
+    var runup = lab.sideways ? LAB_RUNUP_TICKS : 0;
+    var events = ACTIONS[lab.action](lab.tap).map(function (e) { return [e[0] + runup, e[1], e[2]]; });
+    if (lab.sideways) events.unshift([0, dir, 'down']);
+    lab.stage = 'running';
+    lab.t = 0;
+    lab.events = events;
+    lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
+    lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
+                  x0: me[1], y0: me[2], minY: me[2], air: 0, ropeTicks: 0,
+                  ropeLen: null, ropeTarget: null, xEnd: me[1] };
+  }
+
+  function labFinishTrial() {
+    var tr = lab.trial;
+    labReleaseAll();
+    state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways,
+      rise: round3(tr.y0 - tr.minY), air: tr.air, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
+      ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
+    lab.done++;
+    lab.trial = null;
+    if (lab.done >= LAB_TRIALS) { stopLab('Lab finished: ' + lab.done + ' trials of ' + lab.action + '.'); return; }
+    lab.stage = 'gap';
+    lab.waited = 0;
+  }
+
+  // Called after every physics tick while the lab is running.
+  function labTick(bodies, joints) {
+    var players = bodies.filter(function (b) {
+      return b[0] !== BALL_ID && b[0] !== ARENA_OBJECT_ID && b[5] !== null && Math.abs(b[5] - 1) < 0.15;
+    });
+    if (players.length !== 1) {
+      stopLab(players.length ? 'Lab needs a solo room (found ' + players.length + ' players).'
+                             : 'Lab stopped: no player found (are you in a running round?).');
+      return;
+    }
+    var me = players[0];
+    var ball = findBody({ b: bodies }, BALL_ID);
+
+    if (lab.stage === 'waiting' || lab.stage === 'gap') {
+      lab.waited++;
+      if (lab.stage === 'gap') {
+        if (lab.waited < 20) return;
+        lab.stage = 'waiting';
+        lab.waited = 0;
+      }
+      labBrake(me[3] > 0.5 ? 'left' : (me[3] < -0.5 ? 'right' : null));
+      var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5;
+      var far = !ball || Math.hypot(me[1] - ball[1], me[2] - ball[2]) > 8;
+      if (calm && far) labBeginTrial(me);
+      else if (lab.waited > 300) stopLab('Lab stopped: no calm start in 10 seconds (stand on the flat floor, away from the ball).');
+      return;
+    }
+
+    var tr = lab.trial;
+    for (var i = 0; i < lab.events.length; i++) {
+      if (lab.events[i][0] === lab.t) labPress(lab.events[i][1], lab.events[i][2]);
+    }
+    if (lab.t >= tr.runup) {
+      if (me[2] < tr.minY) tr.minY = me[2];
+      if (me[2] < tr.y0 - 0.3) tr.air++;
+    }
+    tr.xEnd = me[1];
+    for (var j = 0; j < joints.length; j++) {
+      if (joints[j][0] === 3 && (joints[j][1] === me[0] || joints[j][2] === me[0])) {
+        tr.ropeTicks++;
+        if (tr.ropeLen === null) tr.ropeLen = joints[j][3];
+        tr.ropeTarget = joints[j][1] === me[0] ? joints[j][2] : joints[j][1];
+        break;
+      }
+    }
+    lab.t++;
+    if (lab.t > tr.runup + LAB_WATCH_TICKS) labFinishTrial();
+  }
+
+  function labSummary() {
+    var groups = {}, order = [];
+    state.labTrials.forEach(function (r) {
+      var key = r.action + ' (tap ' + r.tap + (r.sideways ? ', running' : '') + ')';
+      if (!groups[key]) { groups[key] = []; order.push(key); }
+      groups[key].push(r);
+    });
+    function sorted(g, f) { return g.map(f).sort(function (a, b) { return a - b; }); }
+    return order.slice(-6).map(function (key) {
+      var g = groups[key], rises = sorted(g, function (r) { return r.rise; });
+      var line = key + ': n=' + g.length + ', rise ' + median(rises).toFixed(1) +
+        ' (' + rises[0].toFixed(1) + '-' + rises[rises.length - 1].toFixed(1) + ')' +
+        ', air ' + Math.round(median(sorted(g, function (r) { return r.air; }))) + ' ticks' +
+        ', rope ' + g.filter(function (r) { return r.ropeTicks > 0; }).length + '/' + g.length;
+      if (g[0].sideways) line += ', moved ' + median(sorted(g, function (r) { return r.moved; })).toFixed(1);
+      return line;
+    }).join('\n');
+  }
+
+  function labPanelText() {
+    var parts = [];
+    if (lab) {
+      parts.push('LAB RUNNING (' + lab.action + '): trial ' + Math.min(lab.done + 1, LAB_TRIALS) + ' of ' + LAB_TRIALS +
+                 (lab.stage === 'waiting' ? ', waiting for a calm start away from the ball' : '') +
+                 '. Hands off the keyboard.');
+    } else if (labNote) {
+      parts.push(labNote);
+    }
+    var sum = labSummary();
+    if (sum) parts.push(sum);
+    return parts.join('\n');
+  }
+  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings,
+    note: function () { return labNote; }, active: function () { return !!lab; } };
+
+  // ---------------------------------------------------------------
   // Panel (the visible switch and buttons)
   // ---------------------------------------------------------------
   var ui = {};
@@ -499,7 +679,7 @@
   function buildPanel() {
     var box = document.createElement('div');
     box.id = 'wdb-tool-panel';
-    box.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;' +
+    box.style.cssText = 'position:fixed;left:172px;bottom:8px;z-index:2147483647;' +
       'background:rgba(20,20,30,0.92);color:#fff;font:12px/1.4 sans-serif;padding:8px 10px;' +
       'border:1px solid #555;border-radius:6px;min-width:200px;max-width:420px;user-select:none';
 
@@ -537,6 +717,26 @@
     row2.appendChild(ui.target);
     row2.appendChild(makeButton('Bounce report', runBounceReport));
 
+    var labTitle = document.createElement('div');
+    labTitle.textContent = 'Control lab (sends keys! solo room, stand on the floor away from the ball):';
+    labTitle.style.cssText = 'margin-top:6px;font-weight:bold';
+    var row3 = document.createElement('div');
+    Object.keys(ACTIONS).forEach(function (name) {
+      row3.appendChild(makeButton(name, function () { startLab(name); }));
+    });
+    var row4 = document.createElement('div');
+    ui.labTap = makeButton('', function () {
+      labSettings.tapIndex = (labSettings.tapIndex + 1) % TAP_CHOICES.length;
+      refreshPanel();
+    });
+    ui.labRun = makeButton('', function () {
+      labSettings.holdSideways = !labSettings.holdSideways;
+      refreshPanel();
+    });
+    row4.appendChild(ui.labTap);
+    row4.appendChild(ui.labRun);
+    row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
+
     ui.result = document.createElement('div');
     ui.result.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#ffd866';
 
@@ -545,6 +745,9 @@
     box.appendChild(ui.info);
     box.appendChild(row1);
     box.appendChild(row2);
+    box.appendChild(labTitle);
+    box.appendChild(row3);
+    box.appendChild(row4);
     box.appendChild(ui.result);
     document.body.appendChild(box);
     refreshPanel();
@@ -561,6 +764,8 @@
     ui.botToggle.textContent = state.bot ? 'Bot: turn OFF' : 'Bot: turn ON';
     ui.recToggle.textContent = state.logging ? 'Record: turn OFF' : 'Record: turn ON';
     ui.target.textContent = 'Key target: ' + targetMode;
+    ui.labTap.textContent = 'Keys held: ' + TAP_CHOICES[labSettings.tapIndex] + ' ticks';
+    ui.labRun.textContent = 'Run first: ' + (labSettings.holdSideways ? 'on' : 'off');
     var status = state.hooked ? 'attached to game physics' : 'waiting for the game to load...';
     ui.info.textContent =
       status + '\n' +
@@ -569,7 +774,7 @@
       scoreSummary() +
       (state.bot ? '\nBOT is ON but has no actions built yet' : '') +
       (state.error ? '\n' + state.error : '');
-    ui.result.textContent = state.result;
+    ui.result.textContent = [labPanelText(), state.result].filter(Boolean).join('\n');
   }
 
   setInterval(function () {
