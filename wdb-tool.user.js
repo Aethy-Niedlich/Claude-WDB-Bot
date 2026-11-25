@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.1
+// @version      0.7.2
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.1';
+  var VERSION = '0.7.2';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -486,7 +486,8 @@
   // ---------------------------------------------------------------
   var TAP_CHOICES = [2, 3, 5, 8];   // how many ticks the keys are held (30 ticks = 1 second)
   var LAB_TRIALS = 10;              // trials per button click
-  var LAB_WATCH_TICKS = 45;         // each trial is watched for 1.5 seconds after the action starts
+  var LAB_STAND_WATCH_TICKS = 120;  // standing trials are watched for 4 seconds after the action starts (long jumps need it)
+  var LAB_RUN_WATCH_TICKS = 30;     // run-first trials are watched for 1 second (you keep running the whole time)
   var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
   var labSettings = { tapIndex: 1, holdSideways: false, heavyOffset: -1 };  // heavy goes 1 tick before (-1) or after (+1) the grapple
   var lab = null;                   // set while the lab is running
@@ -514,11 +515,11 @@
   // Which way can the "Run first" run go? Prefer towards the middle, but never towards the ball
   // and never into a wall. Returns 'left', 'right' or null.
   function labPickDirection(x, ballX) {
-    var span = 10, order = x > 30.4 ? ['left', 'right'] : ['right', 'left'];
+    var span = 12, order = x > 30.4 ? ['left', 'right'] : ['right', 'left'];   // a run-first trial covers about 10 units
     for (var i = 0; i < order.length; i++) {
       var sign = order[i] === 'right' ? 1 : -1, end = x + sign * span;
       var wallOk = end > 4 && end < 57;
-      var ballOk = ballX === null || ballX < Math.min(x, end) - 3 || ballX > Math.max(x, end) + 3;
+      var ballOk = ballX === null || ballX < Math.min(x, end) - 4 || ballX > Math.max(x, end) + 4;
       if (wallOk && ballOk) return order[i];
     }
     return null;
@@ -580,7 +581,7 @@
     if (lab.sideways) {
       dir = labPickDirection(me[1], ball ? ball[1] : null);
       if (!dir) {
-        stopLab('Run first needs about 10 units of open floor to run on, away from the ball and the walls. Move to another spot and try again.');
+        stopLab('Run first needs about 12 units of open floor to run on, away from the ball and the walls. Move to another spot and try again.');
         return;
       }
     }
@@ -589,12 +590,13 @@
                    .map(function (e) { return [e[0] + runup, e[1], e[2]]; });
     if (lab.sideways) events.unshift([0, dir, 'down']);
     lab.stage = 'running';
+    lab.watch = lab.sideways ? LAB_RUN_WATCH_TICKS : LAB_STAND_WATCH_TICKS;
     lab.t = 0;
     lab.events = events;
     lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
                   off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
-                  x0: me[1], y0: me[2], minY: me[2], air: 0, ropeTicks: 0,
+                  x0: me[1], y0: me[2], minY: me[2], air: 0, apexT: 0, landT: null, ropeTicks: 0,
                   ropeLen: null, ropeTarget: null, xEnd: me[1] };
   }
 
@@ -602,7 +604,7 @@
     var tr = lab.trial;
     labReleaseAll();
     state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways, heavy: tr.off, x0: round3(tr.x0),
-      rise: round3(tr.y0 - tr.minY), air: tr.air, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
+      rise: round3(tr.y0 - tr.minY), air: tr.air, apex: tr.apexT, land: tr.landT, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
     lab.trial = null;
@@ -649,8 +651,10 @@
       if (lab.events[i][0] === lab.t) labPress(lab.events[i][1], lab.events[i][2]);
     }
     if (lab.t >= tr.runup) {
-      if (me[2] < tr.minY) tr.minY = me[2];
+      var since = lab.t - tr.runup;                        // ticks since the action started
+      if (me[2] < tr.minY) { tr.minY = me[2]; tr.apexT = since; }
       if (me[2] < tr.y0 - 0.3) tr.air++;
+      else if (tr.air >= 3 && tr.landT === null) tr.landT = since;   // back on the ground after being airborne
     }
     tr.xEnd = me[1];
     for (var j = 0; j < joints.length; j++) {
@@ -662,7 +666,7 @@
       }
     }
     lab.t++;
-    if (lab.t > tr.runup + LAB_WATCH_TICKS) labFinishTrial();
+    if (lab.t > tr.runup + lab.watch) labFinishTrial();
   }
 
   function labSummary() {
@@ -674,13 +678,18 @@
       groups[key].push(r);
     });
     function sorted(g, f) { return g.map(f).sort(function (a, b) { return a - b; }); }
-    return order.slice(-6).map(function (key) {
+    return order.slice(-10).map(function (key) {
       var g = groups[key], rises = sorted(g, function (r) { return r.rise; });
+      var landed = g.filter(function (r) { return r.land !== null && r.land !== undefined; });
       var line = key + ': n=' + g.length + ', rise ' + median(rises).toFixed(1) +
         ' (' + rises[0].toFixed(1) + '-' + rises[rises.length - 1].toFixed(1) + ')' +
-        ', air ' + Math.round(median(sorted(g, function (r) { return r.air; }))) + ' ticks' +
+        ', apex@' + Math.round(median(sorted(g, function (r) { return r.apex || 0; }))) +
+        ', land@' + (landed.length === g.length ? Math.round(median(sorted(landed, function (r) { return r.land; }))) : landed.length + '/' + g.length + ' landed') +
         ', rope ' + g.filter(function (r) { return r.ropeTicks > 0; }).length + '/' + g.length;
       if (g[0].sideways) line += ', moved ' + median(sorted(g, function (r) { return r.moved; })).toFixed(1);
+      if (rises[rises.length - 1] - rises[0] > 1) {          // erratic: show every trial in order
+        line += '\n   each trial: ' + g.map(function (r) { return r.rise.toFixed(1); }).join(' ');
+      }
       return line;
     }).join('\n');
   }
