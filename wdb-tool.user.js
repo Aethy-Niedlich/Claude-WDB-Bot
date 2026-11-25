@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.5
+// @version      0.7.6
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.5';
+  var VERSION = '0.7.6';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -488,7 +488,7 @@
   // ---------------------------------------------------------------
   var TAP_CHOICES = [2, 3, 4, 5, 6, 7, 8];   // how many ticks the keys are held (30 ticks = 1 second)
   var LAB_TRIALS = 10;              // trials per button click
-  var LAB_STAND_WATCH_TICKS = 120;  // standing trials are watched for 4 seconds after the action starts (long jumps need it)
+  var LAB_STAND_WATCH_TICKS = 300;  // standing trials are watched for at most 10 seconds, but end shortly after you land
   var LAB_RUN_WATCH_TICKS = 30;     // run-first trials are watched for 1 second (you keep running the whole time)
   var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
   var LAB_PHASES = 8;               // a press is placed at one of this many points of the game's step rhythm
@@ -567,14 +567,31 @@
     lab.brake = want;
   }
 
-  function startLab(name) {
+  // The jump kit: your four jump types, each at the hold length that worked best so far.
+  var KIT = [
+    { action: 'W',          tap: 3, heavy: -1 },   // low
+    { action: 'W+T',        tap: 4, heavy: -1 },   // regular
+    { action: 'W>T keep W', tap: 3, heavy: -1 },   // high
+    { action: 'Space+T',    tap: 5, heavy: -1 },   // super (heavy first)
+    { action: 'W+Space+T',  tap: 5, heavy: 1 }     // super with W (heavy second): reaches the ceiling
+  ];
+  function startKit() {
+    if (lab) return;
+    var queue = KIT.slice(1);
+    startLab(KIT[0].action, KIT[0], queue);
+  }
+
+  function startLab(name, opts, queue) {
     if (lab) return;
     if (!state.hooked) { labNote = 'Not attached to the game yet.'; refreshPanel(); return; }
-    lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
+    opts = opts || {};
+    lab = { action: name, tap: opts.tap || TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
+            heavy: opts.heavy !== undefined ? opts.heavy : labSettings.heavyOffset, queue: queue || null,
+            kitIndex: queue ? KIT.length - queue.length : 0,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
             brake: null, dirSign: 1, homeX: null, arena: null, arena0: null,
             clock: 0, lastBrakeDir: 0, lastBrakeAt: null,
-            scan: labSettings.scan, total: labSettings.scan ? SCAN_TRIALS : LAB_TRIALS };
+            scan: queue ? false : labSettings.scan, total: (queue ? false : labSettings.scan) ? SCAN_TRIALS : LAB_TRIALS };
     labNote = '';
     refreshPanel();
   }
@@ -598,7 +615,7 @@
       }
     }
     var runup = lab.sideways ? LAB_RUNUP_TICKS : 0;
-    var events = labNormalise(ACTIONS[lab.action](lab.tap, labSettings.heavyOffset))
+    var events = labNormalise(ACTIONS[lab.action](lab.tap, lab.heavy))
                    .map(function (e) { return [e[0] + runup, e[1], e[2]]; });
     if (lab.sideways) events.unshift([0, dir, 'down']);
     lab.stage = 'running';
@@ -607,7 +624,7 @@
     lab.events = events;
     lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
-                  off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
+                  off: lab.action.indexOf('Space') >= 0 ? lab.heavy : 0,
                   x0: me[1], y0: me[2], minY: me[2], air: 0, liftT: null, apexT: 0, landT: null, ropeTicks: 0,
                   phase: (stepCount + 1 + runup) % LAB_PHASES, scan: lab.scan,
                   vx0: me[3], vy0: me[4], brakeDir: lab.lastBrakeDir,
@@ -628,7 +645,13 @@
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
     lab.trial = null;
-    if (lab.done >= lab.total) { stopLab('Lab finished: ' + lab.done + ' trials of ' + lab.action + '.'); return; }
+    if (lab.done >= lab.total) {
+      var rest = lab.queue;
+      stopLab('Lab finished: ' + lab.done + ' trials of ' + lab.action + '.');
+      if (rest && rest.length) { var next = rest.shift(); startLab(next.action, next, rest); }
+      else if (rest) { labNote = 'Jump kit finished.'; refreshPanel(); }
+      return;
+    }
     lab.stage = 'gap';
     lab.waited = 0;
   }
@@ -694,7 +717,10 @@
       }
     }
     lab.t++;
-    if (lab.t > tr.runup + lab.watch) labFinishTrial();
+    var elapsed = lab.t - tr.runup;                                  // ticks since the action started
+    var landedAWhileAgo = tr.landT !== null && elapsed >= tr.landT + 5;
+    var neverLeftTheGround = tr.liftT === null && elapsed > 40;
+    if (elapsed > lab.watch || (!lab.sideways && (landedAWhileAgo || neverLeftTheGround))) labFinishTrial();
   }
 
   function labSummary() {
@@ -745,10 +771,28 @@
     }).join('\n');
   }
 
+  // Puts the lab results on the clipboard, so you can paste exact text instead of a screenshot.
+  function copyResults() {
+    var text = [labSummary(), state.result].filter(Boolean).join('\n');
+    var ok = false;
+    try {
+      var box = document.createElement('textarea');
+      box.value = text;
+      box.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(box);
+      box.select();
+      ok = document.execCommand('copy');
+      box.remove();
+    } catch (e) { ok = false; }
+    labNote = ok ? 'Results copied: paste them into the chat.' : 'Could not copy automatically: select the yellow text and copy it.';
+    refreshPanel();
+  }
+
   function labPanelText() {
     var parts = [];
     if (lab) {
-      parts.push('LAB RUNNING (' + lab.action + '): trial ' + Math.min(lab.done + 1, lab.total) + ' of ' + lab.total +
+      parts.push('LAB RUNNING (' + lab.action + '): ' + (lab.queue ? '[jump kit ' + lab.kitIndex + ' of ' + KIT.length + '], ' : '') +
+                 'trial ' + Math.min(lab.done + 1, lab.total) + ' of ' + lab.total +
                  (lab.stage === 'waiting' ? ', waiting for a calm start away from the ball' : '') +
                  '. Hands off the keyboard.');
     } else if (labNote) {
@@ -758,7 +802,7 @@
     if (sum) parts.push(sum);
     return parts.join('\n');
   }
-  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings,
+  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, copy: copyResults,
     note: function () { return labNote; }, active: function () { return !!lab; } };
 
   // ---------------------------------------------------------------
@@ -852,10 +896,12 @@
     row4.appendChild(ui.labRun);
     row4.appendChild(ui.labHeavy);
     row4.appendChild(ui.labScan);
+    row4.appendChild(makeButton('Jump kit', startKit));
+    row4.appendChild(makeButton('Copy results', copyResults));
     row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
 
     ui.result = document.createElement('div');
-    ui.result.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#ffd866';
+    ui.result.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#ffd866;user-select:text';
 
     box.appendChild(title);
     box.appendChild(badges);
