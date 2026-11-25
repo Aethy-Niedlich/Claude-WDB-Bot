@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.4
+// @version      0.7.5
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.4';
+  var VERSION = '0.7.5';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -52,6 +52,7 @@
     result: ''        // result of the last key test, shown in the panel
   };
   var radiusById = {}; // remembers each object's radius so we only look it up once
+  var stepCount = 0;   // physics steps seen since the page loaded (used to find the "phase" of a key press)
   var test = null;     // set while a key test is running
   var targetMode = 'renderer'; // where test key events are sent: renderer / document / window
   window.__wdbTool = { state: state };
@@ -128,6 +129,7 @@
     var original = proto.Step;
     proto.Step = function () {
       var result = original.apply(this, arguments); // let the game do its normal work first
+      stepCount++;
       if (state.logging || test || lab) {
         try {
           var bodies = readBodies(this);
@@ -489,7 +491,9 @@
   var LAB_STAND_WATCH_TICKS = 120;  // standing trials are watched for 4 seconds after the action starts (long jumps need it)
   var LAB_RUN_WATCH_TICKS = 30;     // run-first trials are watched for 1 second (you keep running the whole time)
   var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
-  var labSettings = { tapIndex: 1, holdSideways: false, heavyOffset: -1 };  // heavy goes 1 tick before (-1) or after (+1) the grapple
+  var LAB_PHASES = 8;               // a press is placed at one of this many points of the game's step rhythm
+  var SCAN_TRIALS = 16;             // phase scan: every phase twice
+  var labSettings = { tapIndex: 1, holdSideways: false, heavyOffset: -1, scan: false };  // heavy goes 1 tick before (-1) or after (+1) the grapple
   var lab = null;                   // set while the lab is running
   var labNote = '';
 
@@ -503,6 +507,8 @@
     'W+T':        function (n) { return [[0, 'up', 'down'], [0, 't', 'down'], [n, 'up', 'up'], [n, 't', 'up']]; },
     // "jump, then grapple, and hold up": W goes down first and stays down until the grapple is released
     'W>T hold W': function (n) { return [[0, 'up', 'down'], [2, 't', 'down'], [2 + n, 't', 'up'], [2 + n, 'up', 'up']]; },
+    // same, but W is never released until the trial ends (you usually keep W held after the grapple)
+    'W>T keep W': function (n) { return [[0, 'up', 'down'], [2, 't', 'down'], [2 + n, 't', 'up']]; },
     'Space+T':    function (n, off) { return [[0, 't', 'down'], [n, 't', 'up'], [off, 'space', 'down'], [off + n, 'space', 'up']]; },
     'W+Space+T':  function (n, off) { return [[0, 'up', 'down'], [n, 'up', 'up'], [0, 't', 'down'], [n, 't', 'up'],
                                               [off, 'space', 'down'], [off + n, 'space', 'up']]; },
@@ -567,7 +573,8 @@
     lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
             brake: null, dirSign: 1, homeX: null, arena: null, arena0: null,
-            clock: 0, lastBrakeDir: 0, lastBrakeAt: null };
+            clock: 0, lastBrakeDir: 0, lastBrakeAt: null,
+            scan: labSettings.scan, total: labSettings.scan ? SCAN_TRIALS : LAB_TRIALS };
     labNote = '';
     refreshPanel();
   }
@@ -602,6 +609,7 @@
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
                   off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
                   x0: me[1], y0: me[2], minY: me[2], air: 0, liftT: null, apexT: 0, landT: null, ropeTicks: 0,
+                  phase: (stepCount + 1 + runup) % LAB_PHASES, scan: lab.scan,
                   vx0: me[3], vy0: me[4], brakeDir: lab.lastBrakeDir,
                   sinceBrake: lab.lastBrakeAt === null ? null : lab.clock - lab.lastBrakeAt,
                   y6: lab.arena ? lab.arena[2] : 0,
@@ -616,11 +624,11 @@
     state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways, heavy: tr.off, x0: round3(tr.x0),
       rise: round3(tr.y0 - tr.minY), air: tr.air, lift: tr.liftT, apex: tr.apexT, land: tr.landT,
       arenaY0: round3(tr.arenaY0), arenaV0: round3(tr.arenaV0), arenaMax: round3(tr.arenaMax),
-      y0: round3(tr.y0), vx0: round3(tr.vx0), vy0: round3(tr.vy0), brakeDir: tr.brakeDir, sinceBrake: tr.sinceBrake, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
+      phase: tr.phase, scan: tr.scan, y0: round3(tr.y0), vx0: round3(tr.vx0), vy0: round3(tr.vy0), brakeDir: tr.brakeDir, sinceBrake: tr.sinceBrake, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
     lab.trial = null;
-    if (lab.done >= LAB_TRIALS) { stopLab('Lab finished: ' + lab.done + ' trials of ' + lab.action + '.'); return; }
+    if (lab.done >= lab.total) { stopLab('Lab finished: ' + lab.done + ' trials of ' + lab.action + '.'); return; }
     lab.stage = 'gap';
     lab.waited = 0;
   }
@@ -657,7 +665,9 @@
       var arenaCalm = !lab.arena || (Math.abs(lab.arena[3]) < 0.05 && Math.abs(lab.arena[4]) < 0.05);   // the floor itself is still
       var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5 && Math.abs(me[1] - lab.homeX) < 1.0 && arenaCalm;
       var far = !ball || Math.hypot(me[1] - ball[1], me[2] - ball[2]) > 8;
-      if (calm && far) labBeginTrial(me, ball);
+      var runupTicks = lab.sideways ? LAB_RUNUP_TICKS : 0;
+      var phaseReady = !lab.scan || (stepCount + 1 + runupTicks) % LAB_PHASES === lab.done % LAB_PHASES;
+      if (calm && far && phaseReady) labBeginTrial(me, ball);
       else if (lab.waited > 300) stopLab('Lab stopped: no calm start at your starting spot in 10 seconds (' +
         (arenaCalm ? 'stand on the flat floor, away from the ball).' : 'the arena floor was still moving).'));
       return;
@@ -691,7 +701,7 @@
     var groups = {}, order = [];
     state.labTrials.forEach(function (r) {
       var key = r.action + ' (tap ' + r.tap + (r.heavy ? ', heavy ' + (r.heavy < 0 ? 'first' : 'second') : '') +
-                (r.sideways ? ', running' : '') + ')';
+                (r.sideways ? ', running' : '') + (r.scan ? ', phase scan' : '') + ')';
       if (!groups[key]) { groups[key] = []; order.push(key); }
       groups[key].push(r);
     });
@@ -718,6 +728,13 @@
           line += '\n   start vx: ' + list(function (r) { return r.vx0; }, 3);
           line += '\n   rope length: ' + list(function (r) { return r.ropeLen; }, 2);
           line += '\n   rope ticks: ' + list(function (r) { return r.ropeTicks; }, 0);
+          line += '\n   press phase: ' + list(function (r) { return r.phase; }, 0);
+          var byPhase = [];
+          for (var ph = 0; ph < LAB_PHASES; ph++) {
+            var at = g.filter(function (r) { return r.phase === ph; });
+            if (at.length) byPhase.push(ph + ':' + median(sorted(at, function (r) { return r.rise; })).toFixed(1));
+          }
+          if (byPhase.length > 1) line += '\n   rise by press phase: ' + byPhase.join(' ');
           line += '\n   last steering before: ' + g.map(function (r) {
             return (r.brakeDir < 0 ? '<' : r.brakeDir > 0 ? '>' : '-') + (r.sinceBrake === null || r.sinceBrake === undefined ? '' : r.sinceBrake);
           }).join(' ');
@@ -731,7 +748,7 @@
   function labPanelText() {
     var parts = [];
     if (lab) {
-      parts.push('LAB RUNNING (' + lab.action + '): trial ' + Math.min(lab.done + 1, LAB_TRIALS) + ' of ' + LAB_TRIALS +
+      parts.push('LAB RUNNING (' + lab.action + '): trial ' + Math.min(lab.done + 1, lab.total) + ' of ' + lab.total +
                  (lab.stage === 'waiting' ? ', waiting for a calm start away from the ball' : '') +
                  '. Hands off the keyboard.');
     } else if (labNote) {
@@ -827,9 +844,14 @@
       labSettings.heavyOffset = labSettings.heavyOffset < 0 ? 1 : -1;
       refreshPanel();
     });
+    ui.labScan = makeButton('', function () {
+      labSettings.scan = !labSettings.scan;
+      refreshPanel();
+    });
     row4.appendChild(ui.labTap);
     row4.appendChild(ui.labRun);
     row4.appendChild(ui.labHeavy);
+    row4.appendChild(ui.labScan);
     row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
 
     ui.result = document.createElement('div');
@@ -861,6 +883,7 @@
     ui.target.textContent = 'Key target: ' + targetMode;
     ui.labTap.textContent = 'Keys held: ' + TAP_CHOICES[labSettings.tapIndex] + ' ticks';
     ui.labRun.textContent = 'Run first: ' + (labSettings.holdSideways ? 'on' : 'off');
+    ui.labScan.textContent = 'Phase scan: ' + (labSettings.scan ? 'on (16 trials)' : 'off');
     ui.labHeavy.textContent = 'Heavy: ' + (labSettings.heavyOffset < 0 ? '1 tick before' : '1 tick after') + ' grapple';
     var status = state.hooked ? 'attached to game physics' : 'waiting for the game to load...';
     ui.info.textContent =
