@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.2
+// @version      0.7.3
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.2';
+  var VERSION = '0.7.3';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -498,12 +498,15 @@
   // before, +1 = a tick after). Heavy is never pressed on the very same tick as the grapple, because
   // the game sometimes ignores the grapple then.
   var ACTIONS = {
-    'T':         function (n) { return [[0, 't', 'down'], [n, 't', 'up']]; },
-    'W+T':       function (n) { return [[0, 'up', 'down'], [0, 't', 'down'], [n, 'up', 'up'], [n, 't', 'up']]; },
-    'Space+T':   function (n, off) { return [[0, 't', 'down'], [n, 't', 'up'], [off, 'space', 'down'], [off + n, 'space', 'up']]; },
-    'W+Space+T': function (n, off) { return [[0, 'up', 'down'], [n, 'up', 'up'], [0, 't', 'down'], [n, 't', 'up'],
-                                             [off, 'space', 'down'], [off + n, 'space', 'up']]; },
-    'W then T':  function (n) { return [[0, 'up', 'down'], [2, 'up', 'up'], [2, 't', 'down'], [2 + n, 't', 'up']]; }
+    'T':          function (n) { return [[0, 't', 'down'], [n, 't', 'up']]; },
+    'W':          function (n) { return [[0, 'up', 'down'], [n, 'up', 'up']]; },
+    'W+T':        function (n) { return [[0, 'up', 'down'], [0, 't', 'down'], [n, 'up', 'up'], [n, 't', 'up']]; },
+    // "jump, then grapple, and hold up": W goes down first and stays down until the grapple is released
+    'W>T hold W': function (n) { return [[0, 'up', 'down'], [2, 't', 'down'], [2 + n, 't', 'up'], [2 + n, 'up', 'up']]; },
+    'Space+T':    function (n, off) { return [[0, 't', 'down'], [n, 't', 'up'], [off, 'space', 'down'], [off + n, 'space', 'up']]; },
+    'W+Space+T':  function (n, off) { return [[0, 'up', 'down'], [n, 'up', 'up'], [0, 't', 'down'], [n, 't', 'up'],
+                                              [off, 'space', 'down'], [off + n, 'space', 'up']]; },
+    'W then T':   function (n) { return [[0, 'up', 'down'], [2, 'up', 'up'], [2, 't', 'down'], [2 + n, 't', 'up']]; }
   };
 
   // Shift an action so its earliest key event is at tick 0.
@@ -562,7 +565,7 @@
     if (!state.hooked) { labNote = 'Not attached to the game yet.'; refreshPanel(); return; }
     lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
-            brake: null, dirSign: 1, homeX: null };
+            brake: null, dirSign: 1, homeX: null, arena: null, arena0: null };
     labNote = '';
     refreshPanel();
   }
@@ -596,7 +599,10 @@
     lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
                   off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
-                  x0: me[1], y0: me[2], minY: me[2], air: 0, apexT: 0, landT: null, ropeTicks: 0,
+                  x0: me[1], y0: me[2], minY: me[2], air: 0, liftT: null, apexT: 0, landT: null, ropeTicks: 0,
+                  y6: lab.arena ? lab.arena[2] : 0,
+                  arenaY0: lab.arena && lab.arena0 ? lab.arena[2] - lab.arena0[1] : 0,
+                  arenaV0: lab.arena ? Math.abs(lab.arena[4]) : 0, arenaMax: 0,
                   ropeLen: null, ropeTarget: null, xEnd: me[1] };
   }
 
@@ -604,7 +610,8 @@
     var tr = lab.trial;
     labReleaseAll();
     state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways, heavy: tr.off, x0: round3(tr.x0),
-      rise: round3(tr.y0 - tr.minY), air: tr.air, apex: tr.apexT, land: tr.landT, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
+      rise: round3(tr.y0 - tr.minY), air: tr.air, lift: tr.liftT, apex: tr.apexT, land: tr.landT,
+      arenaY0: round3(tr.arenaY0), arenaV0: round3(tr.arenaV0), arenaMax: round3(tr.arenaMax), moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
     lab.trial = null;
@@ -626,6 +633,8 @@
     var me = players[0];
     var ball = findBody({ b: bodies }, BALL_ID);
     if (lab.homeX === null) lab.homeX = me[1];   // "home" = where you stood when the lab started
+    lab.arena = findBody({ b: bodies }, ARENA_OBJECT_ID);   // the floor piece players can pull on
+    if (lab.arena0 === null && lab.arena) lab.arena0 = [lab.arena[1], lab.arena[2]];
     if (ball && Math.hypot(me[1] - ball[1], me[2] - ball[2]) < 5) {
       stopLab('Lab stopped: you got within 5 units of the ball.');
       return;
@@ -639,10 +648,12 @@
         lab.waited = 0;
       }
       labBrake(labHomeKey(me));   // between trials, walk back to where you started
-      var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5 && Math.abs(me[1] - lab.homeX) < 1.0;
+      var arenaCalm = !lab.arena || (Math.abs(lab.arena[3]) < 0.05 && Math.abs(lab.arena[4]) < 0.05);   // the floor itself is still
+      var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5 && Math.abs(me[1] - lab.homeX) < 1.0 && arenaCalm;
       var far = !ball || Math.hypot(me[1] - ball[1], me[2] - ball[2]) > 8;
       if (calm && far) labBeginTrial(me, ball);
-      else if (lab.waited > 300) stopLab('Lab stopped: no calm start at your starting spot in 10 seconds (stand on the flat floor, away from the ball).');
+      else if (lab.waited > 300) stopLab('Lab stopped: no calm start at your starting spot in 10 seconds (' +
+        (arenaCalm ? 'stand on the flat floor, away from the ball).' : 'the arena floor was still moving).'));
       return;
     }
 
@@ -653,9 +664,10 @@
     if (lab.t >= tr.runup) {
       var since = lab.t - tr.runup;                        // ticks since the action started
       if (me[2] < tr.minY) { tr.minY = me[2]; tr.apexT = since; }
-      if (me[2] < tr.y0 - 0.3) tr.air++;
+      if (me[2] < tr.y0 - 0.3) { tr.air++; if (tr.liftT === null) tr.liftT = since; }   // first tick off the ground
       else if (tr.air >= 3 && tr.landT === null) tr.landT = since;   // back on the ground after being airborne
     }
+    if (lab.arena) tr.arenaMax = Math.max(tr.arenaMax, Math.abs(lab.arena[2] - tr.y6));   // did the floor move?
     tr.xEnd = me[1];
     for (var j = 0; j < joints.length; j++) {
       if (joints[j][0] === 3 && (joints[j][1] === me[0] || joints[j][2] === me[0])) {
@@ -683,12 +695,17 @@
       var landed = g.filter(function (r) { return r.land !== null && r.land !== undefined; });
       var line = key + ': n=' + g.length + ', rise ' + median(rises).toFixed(1) +
         ' (' + rises[0].toFixed(1) + '-' + rises[rises.length - 1].toFixed(1) + ')' +
+        ', lift@' + (g.every(function (r) { return r.lift !== null && r.lift !== undefined; })
+            ? Math.round(median(sorted(g, function (r) { return r.lift; }))) : 'never') +
         ', apex@' + Math.round(median(sorted(g, function (r) { return r.apex || 0; }))) +
         ', land@' + (landed.length === g.length ? Math.round(median(sorted(landed, function (r) { return r.land; }))) : landed.length + '/' + g.length + ' landed') +
         ', rope ' + g.filter(function (r) { return r.ropeTicks > 0; }).length + '/' + g.length;
       if (g[0].sideways) line += ', moved ' + median(sorted(g, function (r) { return r.moved; })).toFixed(1);
       if (rises[rises.length - 1] - rises[0] > 1) {          // erratic: show every trial in order
         line += '\n   each trial: ' + g.map(function (r) { return r.rise.toFixed(1); }).join(' ');
+        line += '\n   x at start: ' + g.map(function (r) { return (r.x0 || 0).toFixed(1); }).join(' ');
+        line += '\n   floor offset at start: ' + g.map(function (r) { return (r.arenaY0 || 0).toFixed(2); }).join(' ');
+        line += '\n   floor moved during: ' + g.map(function (r) { return (r.arenaMax || 0).toFixed(2); }).join(' ');
       }
       return line;
     }).join('\n');
