@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.6
+// @version      0.7.7
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.6';
+  var VERSION = '0.7.7';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -489,7 +489,8 @@
   var TAP_CHOICES = [2, 3, 4, 5, 6, 7, 8];   // how many ticks the keys are held (30 ticks = 1 second)
   var LAB_TRIALS = 10;              // trials per button click
   var LAB_STAND_WATCH_TICKS = 300;  // standing trials are watched for at most 10 seconds, but end shortly after you land
-  var LAB_RUN_WATCH_TICKS = 30;     // run-first trials are watched for 1 second (you keep running the whole time)
+  var LAB_RUN_WATCH_TICKS = 30;     // run-first: you hold the direction key for this long, and 'moved' is measured here
+  var LAB_RUN_MAX_TICKS = 150;      // run-first trials are watched until you land, at most 5 seconds
   var LAB_RUNUP_TICKS = 8;          // with "Run first": run this long before the action starts
   var LAB_PHASES = 8;               // a press is placed at one of this many points of the game's step rhythm
   var SCAN_TRIALS = 16;             // phase scan: every phase twice
@@ -524,11 +525,13 @@
   // Which way can the "Run first" run go? Prefer towards the middle, but never towards the ball
   // and never into a wall. Returns 'left', 'right' or null.
   function labPickDirection(x, ballX) {
-    var span = 12, order = x > 30.4 ? ['left', 'right'] : ['right', 'left'];   // a run-first trial covers about 10 units
+    var span = 11.5;   // a run-first trial moves about 10 units while the direction key is held
+    var order = ballX === null ? (x > 30.4 ? ['left', 'right'] : ['right', 'left'])
+                               : (x < ballX ? ['left', 'right'] : ['right', 'left']);   // away from the ball first
     for (var i = 0; i < order.length; i++) {
       var sign = order[i] === 'right' ? 1 : -1, end = x + sign * span;
-      var wallOk = end > 4 && end < 57;
-      var ballOk = ballX === null || ballX < Math.min(x, end) - 4 || ballX > Math.max(x, end) + 4;
+      var wallOk = end > 3.5 && end < 57.5;
+      var ballOk = ballX === null || ballX < Math.min(x, end) - 6 || ballX > Math.max(x, end) + 6;
       if (wallOk && ballOk) return order[i];
     }
     return null;
@@ -572,8 +575,8 @@
     { action: 'W',          tap: 3, heavy: -1 },   // low
     { action: 'W+T',        tap: 4, heavy: -1 },   // regular
     { action: 'W>T keep W', tap: 3, heavy: -1 },   // high
-    { action: 'Space+T',    tap: 5, heavy: -1 },   // super (heavy first)
-    { action: 'W+Space+T',  tap: 5, heavy: 1 }     // super with W (heavy second): reaches the ceiling
+    { action: 'W+Space+T',  tap: 5, heavy: -1 },   // super (heavy first)
+    { action: 'W+Space+T',  tap: 5, heavy: 1 }     // super-max (heavy second): reaches the ceiling
   ];
   function startKit() {
     if (lab) return;
@@ -610,16 +613,19 @@
     if (lab.sideways) {
       dir = labPickDirection(me[1], ball ? ball[1] : null);
       if (!dir) {
-        stopLab('Run first needs about 12 units of open floor to run on, away from the ball and the walls. Move to another spot and try again.');
+        stopLab('Run first: stand on one side of the ball, about 8 to 15 units from it, with open floor behind you (away from the ball), and try again.');
         return;
       }
     }
     var runup = lab.sideways ? LAB_RUNUP_TICKS : 0;
     var events = labNormalise(ACTIONS[lab.action](lab.tap, lab.heavy))
                    .map(function (e) { return [e[0] + runup, e[1], e[2]]; });
-    if (lab.sideways) events.unshift([0, dir, 'down']);
+    if (lab.sideways) {
+      events.unshift([0, dir, 'down']);
+      events.push([runup + LAB_RUN_WATCH_TICKS, dir, 'up']);   // let go of the direction key after a second
+    }
     lab.stage = 'running';
-    lab.watch = lab.sideways ? LAB_RUN_WATCH_TICKS : LAB_STAND_WATCH_TICKS;
+    lab.watch = lab.sideways ? LAB_RUN_MAX_TICKS : LAB_STAND_WATCH_TICKS;
     lab.t = 0;
     lab.events = events;
     lab.dirSign = lab.sideways ? (dir === 'right' ? 1 : -1) : 1;
@@ -656,6 +662,19 @@
     lab.waited = 0;
   }
 
+  // True if you are practically touching the ball, or on a straight path that gets you within
+  // 3.5 units of it in the next 0.4 seconds. (The ball kills on touch; the two touch at about 2.1 units.)
+  function labBallDanger(me, ball) {
+    if (!ball) return false;
+    var dx = ball[1] - me[1], dy = ball[2] - me[2];
+    if (Math.hypot(dx, dy) < 3.2) return true;
+    var rvx = me[3] - ball[3], rvy = me[4] - ball[4];            // how fast you are closing in on it
+    for (var k = 1; k <= 12; k++) {
+      if (Math.hypot(dx - rvx * k / 30, dy - rvy * k / 30) < 3.5) return true;
+    }
+    return false;
+  }
+
   // Called after every physics tick while the lab is running.
   function labTick(bodies, joints) {
     var players = bodies.filter(function (b) {
@@ -672,8 +691,8 @@
     lab.clock++;
     lab.arena = findBody({ b: bodies }, ARENA_OBJECT_ID);   // the floor piece players can pull on
     if (lab.arena0 === null && lab.arena) lab.arena0 = [lab.arena[1], lab.arena[2]];
-    if (ball && Math.hypot(me[1] - ball[1], me[2] - ball[2]) < 5) {
-      stopLab('Lab stopped: you got within 5 units of the ball.');
+    if (labBallDanger(me, ball)) {
+      stopLab('Lab stopped: you were about to touch the ball.');
       return;
     }
 
@@ -707,7 +726,7 @@
       else if (tr.air >= 3 && tr.landT === null) tr.landT = since;   // back on the ground after being airborne
     }
     if (lab.arena) tr.arenaMax = Math.max(tr.arenaMax, Math.abs(lab.arena[2] - tr.y6));   // did the floor move?
-    tr.xEnd = me[1];
+    if (lab.t - tr.runup <= LAB_RUN_WATCH_TICKS) tr.xEnd = me[1];   // 'moved' = how far you got in the first second
     for (var j = 0; j < joints.length; j++) {
       if (joints[j][0] === 3 && (joints[j][1] === me[0] || joints[j][2] === me[0])) {
         tr.ropeTicks++;
@@ -720,7 +739,7 @@
     var elapsed = lab.t - tr.runup;                                  // ticks since the action started
     var landedAWhileAgo = tr.landT !== null && elapsed >= tr.landT + 5;
     var neverLeftTheGround = tr.liftT === null && elapsed > 40;
-    if (elapsed > lab.watch || (!lab.sideways && (landedAWhileAgo || neverLeftTheGround))) labFinishTrial();
+    if (elapsed > lab.watch || landedAWhileAgo || neverLeftTheGround) labFinishTrial();
   }
 
   function labSummary() {
@@ -752,6 +771,8 @@
           };
           line += '\n   start x: ' + list(function (r) { return r.x0; }, 2);
           line += '\n   start vx: ' + list(function (r) { return r.vx0; }, 3);
+          line += '\n   start y: ' + list(function (r) { return r.y0; }, 4);
+          line += '\n   start vy: ' + list(function (r) { return r.vy0; }, 4);
           line += '\n   rope length: ' + list(function (r) { return r.ropeLen; }, 2);
           line += '\n   rope ticks: ' + list(function (r) { return r.ropeTicks; }, 0);
           line += '\n   press phase: ' + list(function (r) { return r.phase; }, 0);
