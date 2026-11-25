@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.3
+// @version      0.7.4
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.3';
+  var VERSION = '0.7.4';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -484,7 +484,7 @@
   // are timed in game ticks (not browser timers), and every key it pressed
   // is released when it finishes or when you click Stop lab.
   // ---------------------------------------------------------------
-  var TAP_CHOICES = [2, 3, 5, 8];   // how many ticks the keys are held (30 ticks = 1 second)
+  var TAP_CHOICES = [2, 3, 4, 5, 6, 7, 8];   // how many ticks the keys are held (30 ticks = 1 second)
   var LAB_TRIALS = 10;              // trials per button click
   var LAB_STAND_WATCH_TICKS = 120;  // standing trials are watched for 4 seconds after the action starts (long jumps need it)
   var LAB_RUN_WATCH_TICKS = 30;     // run-first trials are watched for 1 second (you keep running the whole time)
@@ -556,7 +556,8 @@
   function labBrake(want) {   // want: 'left', 'right' or null; slows you down between trials
     if (lab.brake === want) return;
     if (lab.brake) labPress(lab.brake, 'up');
-    if (want) labPress(want, 'down');
+    if (want) { labPress(want, 'down'); lab.lastBrakeDir = want === 'left' ? -1 : 1; }
+    lab.lastBrakeAt = lab.clock;
     lab.brake = want;
   }
 
@@ -565,7 +566,8 @@
     if (!state.hooked) { labNote = 'Not attached to the game yet.'; refreshPanel(); return; }
     lab = { action: name, tap: TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
-            brake: null, dirSign: 1, homeX: null, arena: null, arena0: null };
+            brake: null, dirSign: 1, homeX: null, arena: null, arena0: null,
+            clock: 0, lastBrakeDir: 0, lastBrakeAt: null };
     labNote = '';
     refreshPanel();
   }
@@ -600,6 +602,8 @@
     lab.trial = { action: lab.action, tap: lab.tap, sideways: lab.sideways, runup: runup,
                   off: lab.action.indexOf('Space') >= 0 ? labSettings.heavyOffset : 0,
                   x0: me[1], y0: me[2], minY: me[2], air: 0, liftT: null, apexT: 0, landT: null, ropeTicks: 0,
+                  vx0: me[3], vy0: me[4], brakeDir: lab.lastBrakeDir,
+                  sinceBrake: lab.lastBrakeAt === null ? null : lab.clock - lab.lastBrakeAt,
                   y6: lab.arena ? lab.arena[2] : 0,
                   arenaY0: lab.arena && lab.arena0 ? lab.arena[2] - lab.arena0[1] : 0,
                   arenaV0: lab.arena ? Math.abs(lab.arena[4]) : 0, arenaMax: 0,
@@ -611,7 +615,8 @@
     labReleaseAll();
     state.labTrials.push({ action: tr.action, tap: tr.tap, sideways: tr.sideways, heavy: tr.off, x0: round3(tr.x0),
       rise: round3(tr.y0 - tr.minY), air: tr.air, lift: tr.liftT, apex: tr.apexT, land: tr.landT,
-      arenaY0: round3(tr.arenaY0), arenaV0: round3(tr.arenaV0), arenaMax: round3(tr.arenaMax), moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
+      arenaY0: round3(tr.arenaY0), arenaV0: round3(tr.arenaV0), arenaMax: round3(tr.arenaMax),
+      y0: round3(tr.y0), vx0: round3(tr.vx0), vy0: round3(tr.vy0), brakeDir: tr.brakeDir, sinceBrake: tr.sinceBrake, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
       ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
     lab.done++;
     lab.trial = null;
@@ -633,6 +638,7 @@
     var me = players[0];
     var ball = findBody({ b: bodies }, BALL_ID);
     if (lab.homeX === null) lab.homeX = me[1];   // "home" = where you stood when the lab started
+    lab.clock++;
     lab.arena = findBody({ b: bodies }, ARENA_OBJECT_ID);   // the floor piece players can pull on
     if (lab.arena0 === null && lab.arena) lab.arena0 = [lab.arena[1], lab.arena[2]];
     if (ball && Math.hypot(me[1] - ball[1], me[2] - ball[2]) < 5) {
@@ -690,7 +696,8 @@
       groups[key].push(r);
     });
     function sorted(g, f) { return g.map(f).sort(function (a, b) { return a - b; }); }
-    return order.slice(-10).map(function (key) {
+    var shown = order.slice(-10);
+    return shown.map(function (key, gi) {
       var g = groups[key], rises = sorted(g, function (r) { return r.rise; });
       var landed = g.filter(function (r) { return r.land !== null && r.land !== undefined; });
       var line = key + ': n=' + g.length + ', rise ' + median(rises).toFixed(1) +
@@ -703,9 +710,19 @@
       if (g[0].sideways) line += ', moved ' + median(sorted(g, function (r) { return r.moved; })).toFixed(1);
       if (rises[rises.length - 1] - rises[0] > 1) {          // erratic: show every trial in order
         line += '\n   each trial: ' + g.map(function (r) { return r.rise.toFixed(1); }).join(' ');
-        line += '\n   x at start: ' + g.map(function (r) { return (r.x0 || 0).toFixed(1); }).join(' ');
-        line += '\n   floor offset at start: ' + g.map(function (r) { return (r.arenaY0 || 0).toFixed(2); }).join(' ');
-        line += '\n   floor moved during: ' + g.map(function (r) { return (r.arenaMax || 0).toFixed(2); }).join(' ');
+        if (gi === shown.length - 1) {             // details for the group you ran last
+          var list = function (f, d) {
+            return g.map(function (r) { var v = f(r); return v === null || v === undefined ? '-' : (+v).toFixed(d); }).join(' ');
+          };
+          line += '\n   start x: ' + list(function (r) { return r.x0; }, 2);
+          line += '\n   start vx: ' + list(function (r) { return r.vx0; }, 3);
+          line += '\n   rope length: ' + list(function (r) { return r.ropeLen; }, 2);
+          line += '\n   rope ticks: ' + list(function (r) { return r.ropeTicks; }, 0);
+          line += '\n   last steering before: ' + g.map(function (r) {
+            return (r.brakeDir < 0 ? '<' : r.brakeDir > 0 ? '>' : '-') + (r.sinceBrake === null || r.sinceBrake === undefined ? '' : r.sinceBrake);
+          }).join(' ');
+          line += '\n   floor moved at most: ' + Math.max.apply(null, g.map(function (r) { return r.arenaMax || 0; })).toFixed(2);
+        }
       }
       return line;
     }).join('\n');
