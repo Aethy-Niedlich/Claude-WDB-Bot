@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.7
+// @version      0.7.8
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.7';
+  var VERSION = '0.7.8';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -662,15 +662,18 @@
     lab.waited = 0;
   }
 
-  // True if you are practically touching the ball, or on a straight path that gets you within
-  // 3.5 units of it in the next 0.4 seconds. (The ball kills on touch; the two touch at about 2.1 units.)
+  // True if you are practically touching the ball, or on a path (with gravity) that gets you within
+  // 3.5 units of it in the next 0.6 seconds. (The ball kills on touch; the two touch at about 2.1 units.)
   function labBallDanger(me, ball) {
     if (!ball) return false;
     var dx = ball[1] - me[1], dy = ball[2] - me[2];
     if (Math.hypot(dx, dy) < 3.2) return true;
     var rvx = me[3] - ball[3], rvy = me[4] - ball[4];            // how fast you are closing in on it
-    for (var k = 1; k <= 12; k++) {
-      if (Math.hypot(dx - rvx * k / 30, dy - rvy * k / 30) < 3.5) return true;
+    var onFloor = me[2] > 37.9 && Math.abs(me[4]) < 0.5;
+    var g = onFloor ? 0 : 20;                                    // you fall at about 20 units/s^2 (measured from the W jump)
+    for (var k = 1; k <= 18; k++) {                              // the next 0.6 seconds
+      var t = k / 30;
+      if (Math.hypot(dx - rvx * t, dy - rvy * t - 0.5 * g * t * t) < 3.5) return true;
     }
     return false;
   }
@@ -691,8 +694,15 @@
     lab.clock++;
     lab.arena = findBody({ b: bodies }, ARENA_OBJECT_ID);   // the floor piece players can pull on
     if (lab.arena0 === null && lab.arena) lab.arena0 = [lab.arena[1], lab.arena[2]];
+    if (lab.stage === 'avoid') {            // steering away from the ball for a moment, then stopping
+      if (lab.clock >= lab.avoidUntil) stopLab('Lab stopped: you were about to touch the ball, so it steered you away from it first.');
+      return;
+    }
     if (labBallDanger(me, ball)) {
-      stopLab('Lab stopped: you were about to touch the ball.');
+      labReleaseAll();
+      lab.stage = 'avoid';
+      lab.avoidUntil = lab.clock + 25;
+      labPress(me[1] < ball[1] ? 'left' : 'right', 'down');   // push away from the ball
       return;
     }
 
@@ -703,7 +713,7 @@
         lab.stage = 'waiting';
         lab.waited = 0;
       }
-      labBrake(labHomeKey(me));   // between trials, walk back to where you started
+      labBrake(me[2] > 37.9 && Math.abs(me[4]) < 0.5 ? labHomeKey(me) : null);   // between trials, walk back to where you started (only while on the floor)
       var arenaCalm = !lab.arena || (Math.abs(lab.arena[3]) < 0.05 && Math.abs(lab.arena[4]) < 0.05);   // the floor itself is still
       var calm = me[2] > 37.9 && Math.abs(me[4]) < 0.5 && Math.abs(me[3]) < 0.5 && Math.abs(me[1] - lab.homeX) < 1.0 && arenaCalm;
       var far = !ball || Math.hypot(me[1] - ball[1], me[2] - ball[2]) > 8;
@@ -739,7 +749,8 @@
     var elapsed = lab.t - tr.runup;                                  // ticks since the action started
     var landedAWhileAgo = tr.landT !== null && elapsed >= tr.landT + 5;
     var neverLeftTheGround = tr.liftT === null && elapsed > 40;
-    if (elapsed > lab.watch || landedAWhileAgo || neverLeftTheGround) labFinishTrial();
+    var onTheFloor = me[2] > 37.9 && Math.abs(me[4]) < 0.5;
+    if ((elapsed > lab.watch && onTheFloor) || landedAWhileAgo || neverLeftTheGround || elapsed > 900) labFinishTrial();
   }
 
   function labSummary() {
@@ -823,7 +834,7 @@
     if (sum) parts.push(sum);
     return parts.join('\n');
   }
-  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, copy: copyResults,
+  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
     note: function () { return labNote; }, active: function () { return !!lab; } };
 
   // ---------------------------------------------------------------
