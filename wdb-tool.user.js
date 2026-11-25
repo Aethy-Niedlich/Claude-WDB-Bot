@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.7.8
+// @version      0.8.0
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.7.8';
+  var VERSION = '0.8.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -45,6 +45,7 @@
     attachedTicks: 0, // how many logged ticks had a rope (grapple) on the ball
     score: { n: 0, within1: 0, within2: 0, within4: 0, errs: [] }, // live self-score of the ball predictor
     labTrials: [],    // finished control-lab trials (saved in the log's first line)
+    moveTrials: [],   // finished move-test trials (saved in the log's first line)
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -186,7 +187,8 @@
       ropeField: 'j = ropes (grapples), each [type, bodyA id, bodyB id, rope length]; only present while a rope exists',
       keys: state.keys,
       predictorScore: scoreSummary(),
-      labTrials: state.labTrials
+      labTrials: state.labTrials,
+      moveTrials: state.moveTrials
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -207,6 +209,7 @@
     state.error = '';
     resetScore();
     state.labTrials = [];
+    state.moveTrials = [];
   }
 
   // ---------------------------------------------------------------
@@ -590,7 +593,7 @@
     opts = opts || {};
     lab = { action: name, tap: opts.tap || TAP_CHOICES[labSettings.tapIndex], sideways: labSettings.holdSideways,
             heavy: opts.heavy !== undefined ? opts.heavy : labSettings.heavyOffset, queue: queue || null,
-            kitIndex: queue ? KIT.length - queue.length : 0,
+            kitIndex: queue ? KIT.length - queue.length : 0, mode: opts.mode || 'jump', mv: null,
             stage: 'waiting', waited: 0, t: 0, done: 0, held: {}, trial: null, events: [],
             brake: null, dirSign: 1, homeX: null, arena: null, arena0: null,
             clock: 0, lastBrakeDir: 0, lastBrakeAt: null,
@@ -662,6 +665,96 @@
     lab.waited = 0;
   }
 
+  // ---------------------------------------------------------------
+  // Move test: walk to chosen spots on your side of the ball and stand still there.
+  // Ground only: it never jumps, never crosses the ball, and never steers while you are in the air.
+  // ---------------------------------------------------------------
+  var MOVE_ACCEL = 12.8;         // units/s^2 (measured: about 0.43 speed per tick while a direction key is held)
+  var MOVE_TRIALS = 10;
+  var MOVE_LIMIT_TICKS = 90;     // must be within 1 unit and almost still within 3 seconds
+  var MOVE_HOLD_TICKS = 15;      // then stay within 1 unit for half a second
+  var MOVE_SPOTS = [0.0, 1.0, 0.45, 0.9, 0.1, 0.65, 0.2, 0.8, 0.3, 0.55];   // where in your zone each target is (0 = outer end, 1 = the end nearest the ball)
+
+  // Which key to hold to arrive at `target` and stop there. It brakes when the distance you would
+  // still slide (speed squared over twice the acceleration) reaches the target.
+  function moveKey(x, v, target) {
+    var stop = v * Math.abs(v) / (2 * MOVE_ACCEL);
+    var err = target - (x + stop);
+    var dead = Math.abs(v) < 1 ? 0.1 : 0.2;
+    return err > dead ? 'right' : (err < -dead ? 'left' : null);
+  }
+
+  function moveNextTarget(me) {
+    var mv = lab.mv;
+    if (mv.i >= MOVE_TRIALS) { stopLab('Move test finished.'); return; }
+    mv.from = me[1];
+    mv.target = mv.zoneOuter + MOVE_SPOTS[mv.i % MOVE_SPOTS.length] * (mv.zoneInner - mv.zoneOuter);
+    mv.phase = 'goto';
+    mv.t = 0; mv.holdT = 0; mv.settled = null; mv.holdMax = 0; mv.over = 0; mv.peak = 0;
+    lab.done = mv.i;
+  }
+
+  function moveRecord() {
+    var mv = lab.mv;
+    state.moveTrials.push({ from: round3(mv.from), target: round3(mv.target), dist: round3(Math.abs(mv.target - mv.from)),
+      settle: mv.settled, hold: round3(mv.holdMax), over: round3(mv.over), peak: round3(mv.peak),
+      ok: mv.settled !== null && mv.holdMax < 1.0 });
+    mv.i++;
+  }
+
+  function moveTick(me, ball) {
+    var onFloor = me[2] > 37.9 && Math.abs(me[4]) < 0.5;
+    if (!lab.mv) {
+      if (!ball || Math.hypot(ball[3], ball[4]) > 1) { stopLab('Move test needs the ball resting on the bump. Try again once it has settled.'); return; }
+      if (Math.abs(me[1] - ball[1]) < 8) { stopLab('Move test: stand at least 8 units from the ball first.'); return; }
+      var left = me[1] < ball[1];
+      var outer = left ? 5 : 56, inner = left ? ball[1] - 9 : ball[1] + 9;   // your zone: between the wall and 9 units from the ball
+      if (Math.abs(inner - outer) < 8) { stopLab('Move test: the ball is too far off-centre to leave enough floor on your side.'); return; }
+      lab.mv = { zoneOuter: outer, zoneInner: inner, i: 0 };
+      lab.stage = 'moving';
+      moveNextTarget(me);
+    }
+    var mv = lab.mv;
+    if (!onFloor) { labBrake(null); return; }            // never steer in the air
+    var err = mv.target - me[1];
+    var sign = mv.target >= mv.from ? 1 : -1;
+    mv.peak = Math.max(mv.peak, Math.abs(me[3]));
+    mv.over = Math.max(mv.over, sign * (me[1] - mv.target));
+    labBrake(moveKey(me[1], me[3], mv.target));
+    if (mv.phase === 'goto') {
+      mv.t++;
+      if (Math.abs(err) < 1.0 && Math.abs(me[3]) < 0.5) { mv.settled = mv.t; mv.phase = 'hold'; mv.holdT = 0; }
+      else if (mv.t > MOVE_LIMIT_TICKS) { moveRecord(); moveNextTarget(me); }
+    } else {
+      mv.holdT++;
+      mv.holdMax = Math.max(mv.holdMax, Math.abs(err));
+      if (mv.holdT >= MOVE_HOLD_TICKS) { moveRecord(); moveNextTarget(me); }
+    }
+  }
+
+  function moveSummary() {
+    var tr = state.moveTrials;
+    if (!tr.length) return '';
+    var ok = tr.filter(function (r) { return r.ok; }).length;
+    var settled = tr.filter(function (r) { return r.settle !== null; }).map(function (r) { return r.settle; })
+                    .sort(function (a, b) { return a - b; });
+    var worstHold = Math.max.apply(null, tr.map(function (r) { return r.hold; }));
+    var worstOver = Math.max.apply(null, tr.map(function (r) { return r.over; }));
+    var lines = ['Move test: ' + ok + '/' + tr.length + ' ok (within 1 unit and almost still in 3 s, then held half a second)'];
+    if (settled.length) {
+      lines.push('  arrival: median ' + Math.round(median(settled)) + ' ticks (' + (median(settled) / 30).toFixed(1) +
+                 ' s), slowest ' + settled[settled.length - 1] + ' ticks');
+    }
+    lines.push('  overshoot at most ' + worstOver.toFixed(2) + ' units, drift while holding at most ' + worstHold.toFixed(2));
+    lines.push('  each (distance:ticks): ' + tr.map(function (r) { return r.dist.toFixed(0) + ':' + (r.settle === null ? 'FAIL' : r.settle); }).join(' '));
+    return lines.join('\n');
+  }
+
+  function startMove() {
+    if (lab) return;
+    startLab('Move test', { mode: 'move' });
+  }
+
   // True if you are practically touching the ball, or on a path (with gravity) that gets you within
   // 3.5 units of it in the next 0.6 seconds. (The ball kills on touch; the two touch at about 2.1 units.)
   function labBallDanger(me, ball) {
@@ -705,6 +798,8 @@
       labPress(me[1] < ball[1] ? 'left' : 'right', 'down');   // push away from the ball
       return;
     }
+
+    if (lab.mode === 'move') { moveTick(me, ball); return; }
 
     if (lab.stage === 'waiting' || lab.stage === 'gap') {
       lab.waited++;
@@ -805,7 +900,7 @@
 
   // Puts the lab results on the clipboard, so you can paste exact text instead of a screenshot.
   function copyResults() {
-    var text = [labSummary(), state.result].filter(Boolean).join('\n');
+    var text = [labSummary(), moveSummary(), state.result].filter(Boolean).join('\n');
     var ok = false;
     try {
       var box = document.createElement('textarea');
@@ -832,9 +927,11 @@
     }
     var sum = labSummary();
     if (sum) parts.push(sum);
+    var mvs = moveSummary();
+    if (mvs) parts.push(mvs);
     return parts.join('\n');
   }
-  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
+  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, move: startMove, moveSummary: moveSummary, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
     note: function () { return labNote; }, active: function () { return !!lab; } };
 
   // ---------------------------------------------------------------
@@ -929,6 +1026,7 @@
     row4.appendChild(ui.labHeavy);
     row4.appendChild(ui.labScan);
     row4.appendChild(makeButton('Jump kit', startKit));
+    row4.appendChild(makeButton('Move test', startMove));
     row4.appendChild(makeButton('Copy results', copyResults));
     row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
 
