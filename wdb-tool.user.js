@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.8.0
+// @version      0.8.1
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.8.0';
+  var VERSION = '0.8.1';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -519,6 +519,13 @@
     'W then T':   function (n) { return [[0, 'up', 'down'], [2, 'up', 'up'], [2, 't', 'down'], [2 + n, 't', 'up']]; }
   };
 
+  // Reach test: a floaty jump (W kept down), then a second grapple press k ticks in, to see what the
+  // grapple latches onto from different heights and how far away it was.
+  var REACH_TIMES = [6, 12, 18, 24, 32, 40, 52, 64, 80, 100];
+  function reachAction(n, off, k) {
+    return [[0, 'up', 'down'], [2, 't', 'down'], [2 + n, 't', 'up'], [2 + k, 't', 'down'], [2 + k + n, 't', 'up']];
+  }
+
   // Shift an action so its earliest key event is at tick 0.
   function labNormalise(events) {
     var first = Math.min.apply(null, events.map(function (e) { return e[0]; }));
@@ -598,6 +605,7 @@
             brake: null, dirSign: 1, homeX: null, arena: null, arena0: null,
             clock: 0, lastBrakeDir: 0, lastBrakeAt: null,
             scan: queue ? false : labSettings.scan, total: (queue ? false : labSettings.scan) ? SCAN_TRIALS : LAB_TRIALS };
+    if (opts.again) { lab.againList = REACH_TIMES; lab.total = REACH_TIMES.length * 2; }   // reach test: two trials per press time
     labNote = '';
     refreshPanel();
   }
@@ -621,7 +629,9 @@
       }
     }
     var runup = lab.sideways ? LAB_RUNUP_TICKS : 0;
-    var events = labNormalise(ACTIONS[lab.action](lab.tap, lab.heavy))
+    var kAgain = lab.againList ? lab.againList[Math.floor(lab.done / 2)] : null;
+    var make = lab.againList ? reachAction : ACTIONS[lab.action];
+    var events = labNormalise(make(lab.tap, lab.heavy, kAgain))
                    .map(function (e) { return [e[0] + runup, e[1], e[2]]; });
     if (lab.sideways) {
       events.unshift([0, dir, 'down']);
@@ -636,6 +646,7 @@
                   off: lab.action.indexOf('Space') >= 0 ? lab.heavy : 0,
                   x0: me[1], y0: me[2], minY: me[2], air: 0, liftT: null, apexT: 0, landT: null, ropeTicks: 0,
                   phase: (stepCount + 1 + runup) % LAB_PHASES, scan: lab.scan,
+                  again: kAgain, upAtAgain: null, ropes: [], ropeWas: false,
                   vx0: me[3], vy0: me[4], brakeDir: lab.lastBrakeDir,
                   sinceBrake: lab.lastBrakeAt === null ? null : lab.clock - lab.lastBrakeAt,
                   y6: lab.arena ? lab.arena[2] : 0,
@@ -651,7 +662,8 @@
       rise: round3(tr.y0 - tr.minY), air: tr.air, lift: tr.liftT, apex: tr.apexT, land: tr.landT,
       arenaY0: round3(tr.arenaY0), arenaV0: round3(tr.arenaV0), arenaMax: round3(tr.arenaMax),
       phase: tr.phase, scan: tr.scan, y0: round3(tr.y0), vx0: round3(tr.vx0), vy0: round3(tr.vy0), brakeDir: tr.brakeDir, sinceBrake: tr.sinceBrake, moved: round3((tr.xEnd - tr.x0) * lab.dirSign),
-      ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget });
+      ropeTicks: tr.ropeTicks, ropeLen: tr.ropeLen, ropeTarget: tr.ropeTarget,
+      again: tr.again, upAtAgain: tr.upAtAgain, ropes: tr.ropes });
     lab.done++;
     lab.trial = null;
     if (lab.done >= lab.total) {
@@ -750,6 +762,32 @@
     return lines.join('\n');
   }
 
+  function reachSummary() {
+    var rows = state.labTrials.filter(function (r) { return r.action === 'Reach'; });
+    if (!rows.length) return '';
+    var byK = {}, order = [];
+    rows.forEach(function (r) {
+      if (!byK[r.again]) { byK[r.again] = []; order.push(r.again); }
+      byK[r.again].push(r);
+    });
+    var lines = ['Reach test (second grapple press in mid-air; distance = from your centre to the floor surface):'];
+    order.forEach(function (k) {
+      var h = byK[k][0].upAtAgain;
+      var outcomes = byK[k].map(function (r) {
+        if (r.upAtAgain === null || r.upAtAgain === undefined) return 'never pressed (you landed first)';
+        var rope = (r.ropes || []).filter(function (x) { return x.at >= 2 + k; })[0];
+        return rope ? 'rope to id' + rope.target + ' len ' + (+rope.len).toFixed(1) : 'no rope';
+      });
+      lines.push('  press at tick ' + k + ', ' + (h === null || h === undefined ? '?' : (h + 1).toFixed(1)) + ' up: ' + outcomes.join(' | '));
+    });
+    return lines.join('\n');
+  }
+
+  function startReach() {
+    if (lab) return;
+    startLab('Reach', { tap: 3, heavy: -1, again: true });
+  }
+
   function startMove() {
     if (lab) return;
     startLab('Move test', { mode: 'move' });
@@ -832,14 +870,19 @@
     }
     if (lab.arena) tr.arenaMax = Math.max(tr.arenaMax, Math.abs(lab.arena[2] - tr.y6));   // did the floor move?
     if (lab.t - tr.runup <= LAB_RUN_WATCH_TICKS) tr.xEnd = me[1];   // 'moved' = how far you got in the first second
+    var ropeNow = null;
     for (var j = 0; j < joints.length; j++) {
-      if (joints[j][0] === 3 && (joints[j][1] === me[0] || joints[j][2] === me[0])) {
-        tr.ropeTicks++;
-        if (tr.ropeLen === null) tr.ropeLen = joints[j][3];
-        tr.ropeTarget = joints[j][1] === me[0] ? joints[j][2] : joints[j][1];
-        break;
-      }
+      if (joints[j][0] === 3 && (joints[j][1] === me[0] || joints[j][2] === me[0])) { ropeNow = joints[j]; break; }
     }
+    if (ropeNow) {
+      var ropeTarget = ropeNow[1] === me[0] ? ropeNow[2] : ropeNow[1];
+      tr.ropeTicks++;
+      if (tr.ropeLen === null) tr.ropeLen = ropeNow[3];
+      tr.ropeTarget = ropeTarget;
+      if (!tr.ropeWas) tr.ropes.push({ at: lab.t - tr.runup, target: ropeTarget, len: ropeNow[3] });   // a new rope just appeared
+    }
+    tr.ropeWas = !!ropeNow;
+    if (tr.again !== null && lab.t - tr.runup === 2 + tr.again) tr.upAtAgain = round3(tr.y0 - me[2]);   // how high you were at the second press
     lab.t++;
     var elapsed = lab.t - tr.runup;                                  // ticks since the action started
     var landedAWhileAgo = tr.landT !== null && elapsed >= tr.landT + 5;
@@ -851,6 +894,7 @@
   function labSummary() {
     var groups = {}, order = [];
     state.labTrials.forEach(function (r) {
+      if (r.action === 'Reach') return;   // shown by reachSummary
       var key = r.action + ' (tap ' + r.tap + (r.heavy ? ', heavy ' + (r.heavy < 0 ? 'first' : 'second') : '') +
                 (r.sideways ? ', running' : '') + (r.scan ? ', phase scan' : '') + ')';
       if (!groups[key]) { groups[key] = []; order.push(key); }
@@ -900,7 +944,7 @@
 
   // Puts the lab results on the clipboard, so you can paste exact text instead of a screenshot.
   function copyResults() {
-    var text = [labSummary(), moveSummary(), state.result].filter(Boolean).join('\n');
+    var text = [labSummary(), moveSummary(), reachSummary(), state.result].filter(Boolean).join('\n');
     var ok = false;
     try {
       var box = document.createElement('textarea');
@@ -929,9 +973,11 @@
     if (sum) parts.push(sum);
     var mvs = moveSummary();
     if (mvs) parts.push(mvs);
+    var rs = reachSummary();
+    if (rs) parts.push(rs);
     return parts.join('\n');
   }
-  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, move: startMove, moveSummary: moveSummary, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
+  window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, move: startMove, moveSummary: moveSummary, reach: startReach, reachSummary: reachSummary, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
     note: function () { return labNote; }, active: function () { return !!lab; } };
 
   // ---------------------------------------------------------------
@@ -1027,6 +1073,7 @@
     row4.appendChild(ui.labScan);
     row4.appendChild(makeButton('Jump kit', startKit));
     row4.appendChild(makeButton('Move test', startMove));
+    row4.appendChild(makeButton('Reach test', startReach));
     row4.appendChild(makeButton('Copy results', copyResults));
     row4.appendChild(makeButton('Stop lab', function () { stopLab('Lab stopped.'); }));
 
