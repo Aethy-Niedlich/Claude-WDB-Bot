@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.8.1
+// @version      0.9.0
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.8.1';
+  var VERSION = '0.9.0';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -46,6 +46,8 @@
     score: { n: 0, within1: 0, within2: 0, within4: 0, errs: [] }, // live self-score of the ball predictor
     labTrials: [],    // finished control-lab trials (saved in the log's first line)
     moveTrials: [],   // finished move-test trials (saved in the log's first line)
+    track: false,     // the passive defence tracker (it only watches, it never presses keys)
+    def: null,        // what the tracker has seen (set up below)
     hooked: false,    // true once we are attached to the game's physics
     ticks: 0,         // how many physics ticks we have logged
     lines: [],        // one text line per tick
@@ -131,13 +133,14 @@
     proto.Step = function () {
       var result = original.apply(this, arguments); // let the game do its normal work first
       stepCount++;
-      if (state.logging || test || lab) {
+      if (state.logging || test || lab || state.track) {
         try {
           var bodies = readBodies(this);
           var joints = readJoints(this);
           if (state.logging) { logTick(bodies, joints); scoreTick(bodies, joints); }
           if (test) updateTest(bodies);
           if (lab) labTick(bodies, joints);
+          if (state.track) trackTick(bodies, joints);
         } catch (e) { state.error = 'read error: ' + e.message; }
       }
       return result;
@@ -188,7 +191,8 @@
       keys: state.keys,
       predictorScore: scoreSummary(),
       labTrials: state.labTrials,
-      moveTrials: state.moveTrials
+      moveTrials: state.moveTrials,
+      defence: { me: state.def.me, shots: state.def.shots, noWarning: state.def.noWarning, deaths: state.def.deaths, saves: state.def.saves, stand: state.def.stand }
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -210,12 +214,14 @@
     resetScore();
     state.labTrials = [];
     state.moveTrials = [];
+    state.def = newDefence();
   }
 
   // ---------------------------------------------------------------
   // Your own key presses (real keyboard only, while RECORD is on)
   // ---------------------------------------------------------------
   function noteKey(type, e) {
+    if (e.isTrusted && !e.repeat) trackKey(type, e.code);   // lets the tracker work out which player is you
     if (!state.logging) return;
     if (!e.isTrusted) return;   // ignore keys sent by this tool's own tests
     if (e.repeat) return;       // ignore the keyboard's auto-repeat
@@ -944,7 +950,7 @@
 
   // Puts the lab results on the clipboard, so you can paste exact text instead of a screenshot.
   function copyResults() {
-    var text = [labSummary(), moveSummary(), reachSummary(), state.result].filter(Boolean).join('\n');
+    var text = [labSummary(), moveSummary(), reachSummary(), defenceSummary(), state.result].filter(Boolean).join('\n');
     var ok = false;
     try {
       var box = document.createElement('textarea');
@@ -975,10 +981,159 @@
     if (mvs) parts.push(mvs);
     var rs = reachSummary();
     if (rs) parts.push(rs);
+    var ds = defenceSummary();
+    if (ds) parts.push(ds);
     return parts.join('\n');
   }
   window.__wdbTool.lab = { start: startLab, stop: stopLab, summary: labSummary, settings: labSettings, kit: startKit, move: startMove, moveSummary: moveSummary, reach: startReach, reachSummary: reachSummary, copy: copyResults, stage: function () { return lab ? lab.stage : null; },
     note: function () { return labNote; }, active: function () { return !!lab; } };
+
+  // ---------------------------------------------------------------
+  // Defence tracker (passive: it only watches, it never presses any key).
+  // It finds which player is you from your real key presses, spots shots at a net
+  // (the free ball is predicted to reach a net within 2 seconds), and records how
+  // each shot ended: saved by your grapple, goal, fizzled, or grabbed by someone else.
+  // ---------------------------------------------------------------
+  var TRACK_HORIZON = 60;                           // look 2 seconds ahead
+  var NET_X_LEFT = 2.0, NET_X_RIGHT = 58.9, NET_Y = 27.0;   // the ball counts as "in the net" past these lines
+
+  function newDefence() {
+    return { me: null, votes: {}, shots: [], shot: null, noWarning: 0, deaths: 0, missing: 0, inNet: false,
+             stand: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], standTicks: 0, saves: [], tick: 0, keyWatch: null };
+  }
+  state.def = newDefence();
+
+  // Will the free ball reach a net within `steps` ticks? Returns { net, ticks } or null.
+  function predictNet(x, y, vx, vy, steps) {
+    for (var i = 1; i <= steps; i++) {
+      vy += GRAVITY_PER_TICK;
+      var nx = x + vx * TICK_SECONDS, ny = y + vy * TICK_SECONDS;
+      if (ny > FLOOR_Y) { ny = FLOOR_Y; vy = 0; }
+      else if (ny < CEILING_Y) { ny = CEILING_Y; vy = 0; }
+      if (ny < NET_TOP_Y) {
+        if (nx > WALL_RIGHT) { nx = WALL_RIGHT; vx = 0; }
+        else if (nx < WALL_LEFT) { nx = WALL_LEFT; vx = 0; }
+      }
+      x = nx; y = ny;
+      if (y > NET_Y && x < NET_X_LEFT) return { net: 'left', ticks: i };
+      if (y > NET_Y && x > NET_X_RIGHT) return { net: 'right', ticks: i };
+    }
+    return null;
+  }
+
+  function isPlayerBody(b) {
+    return b[0] !== BALL_ID && b[0] !== ARENA_OBJECT_ID && b[5] !== null && Math.abs(b[5] - 1) < 0.15;
+  }
+
+  // The id at the other end of a rope that is attached to the ball, or null.
+  function ropeOnBall(tick) {
+    if (!tick.j) return null;
+    for (var i = 0; i < tick.j.length; i++) {
+      if (tick.j[i][0] !== 3) continue;
+      if (tick.j[i][1] === BALL_ID) return tick.j[i][2];
+      if (tick.j[i][2] === BALL_ID) return tick.j[i][1];
+    }
+    return null;
+  }
+
+  // Which player is you? Watch who speeds up in the direction of your real A or D presses.
+  function trackKey(type, code) {
+    if (!state.track || type !== 'down' || (code !== 'KeyA' && code !== 'KeyD')) return;
+    state.def.keyWatch = { dir: code === 'KeyD' ? 1 : -1, left: 4, v0: null };
+  }
+
+  function identifyStep(players) {
+    var d = state.def, w = d.keyWatch;
+    if (!w) return;
+    if (w.v0 === null) { w.v0 = {}; players.forEach(function (p) { w.v0[p[0]] = p[3]; }); return; }
+    if (--w.left > 0) return;
+    var best = null, second = -1e9;
+    players.forEach(function (p) {
+      var gain = (p[3] - (w.v0[p[0]] === undefined ? p[3] : w.v0[p[0]])) * w.dir;
+      if (!best || gain > best.gain) { if (best) second = Math.max(second, best.gain); best = { id: p[0], gain: gain }; }
+      else second = Math.max(second, gain);
+    });
+    d.keyWatch = null;
+    if (!best || best.gain < 1.2 || best.gain < second + 0.8) return;   // not a clear winner
+    d.votes[best.id] = (d.votes[best.id] || 0) + 1;
+    var ranked = Object.keys(d.votes).sort(function (a, b) { return d.votes[b] - d.votes[a]; });
+    var top = d.votes[ranked[0]], next = ranked.length > 1 ? d.votes[ranked[1]] : 0;
+    if (top >= 2 && top - next >= 2) d.me = +ranked[0];
+  }
+
+  function endShot(outcome, me) {
+    var d = state.def, sh = d.shot;
+    d.shot = null;
+    var rec = { net: sh.net, mine: sh.mySide === sh.net, warn: sh.warn, outcome: outcome, ticks: d.tick - sh.start,
+                meX: sh.meX === null ? null : round3(sh.meX) };
+    d.shots.push(rec);
+    if (outcome === 'saved' && me) d.saves.push({ x: round3(me[1]), y: round3(me[2]) });
+  }
+
+  function trackTick(bodies, joints) {
+    var d = state.def, tick = { b: bodies, j: joints };
+    d.tick++;
+    var players = bodies.filter(isPlayerBody);
+    if (players.length === 1 && d.me === null) d.me = players[0][0];   // alone in the room, and not yet identified: that is you
+    identifyStep(players);
+    var me = d.me === null ? null : findBody(tick, d.me);
+    var ball = findBody(tick, BALL_ID);
+
+    // deaths: you vanish from the world while the ball is still there
+    if (d.me !== null && ball) {
+      if (!me) { d.missing++; if (d.missing === 3) d.deaths++; } else d.missing = 0;
+    }
+    if (!ball) return;
+
+    var rope = ropeOnBall(tick);
+    if (me && rope === null) d.stand[Math.min(11, Math.max(0, Math.floor(me[1] / 5)))]++, d.standTicks++;
+
+    var net = ball[2] > NET_Y && (ball[1] < NET_X_LEFT || ball[1] > NET_X_RIGHT) ? (ball[1] < NET_X_LEFT ? 'left' : 'right') : null;
+    if (net && !d.inNet) {                               // the ball has just gone into a net
+      d.inNet = true;
+      if (d.shot) endShot('goal', me); else d.noWarning++;
+      return;
+    }
+    if (!net) d.inNet = false;
+    if (net) return;
+
+    if (d.shot) {
+      if (rope !== null) { endShot(rope === d.me ? 'saved' : 'grabbed by id' + rope, me); return; }
+      var again = predictNet(ball[1], ball[2], ball[3], ball[4], TRACK_HORIZON);
+      if (again && again.net === d.shot.net) d.shot.lost = 0;
+      else if (++d.shot.lost >= 10) endShot('fizzled', me);
+    } else if (rope === null) {
+      var pr = predictNet(ball[1], ball[2], ball[3], ball[4], TRACK_HORIZON);
+      if (pr) d.shot = { net: pr.net, warn: pr.ticks, start: d.tick, lost: 0,
+                         mySide: me ? (me[1] < 30.4 ? 'left' : 'right') : null, meX: me ? me[1] : null };
+    }
+  }
+
+  function defenceSummary() {
+    var d = state.def;
+    if (!state.track && !d.shots.length && d.me === null) return '';
+    function n(arr, o) { return arr.filter(function (s) { return s.outcome === o; }).length; }
+    var mine = d.shots.filter(function (s) { return s.mine; });
+    var other = d.shots.filter(function (s) { return !s.mine; });
+    var lines = ['Defence tracker (passive, presses no keys): ' + (d.me === null ? 'I have not found you yet: press A or D for a moment' : 'you are id' + d.me)];
+    lines.push('  shots at your net: ' + mine.length + ' | saved ' + n(mine, 'saved') + ', goals against ' + n(mine, 'goal') +
+               ', fizzled ' + n(mine, 'fizzled') + ', grabbed by others ' + mine.filter(function (s) { return s.outcome.indexOf('grabbed') === 0; }).length);
+    lines.push('  shots at the other net: ' + other.length + ' | goals ' + n(other, 'goal') + ', fizzled ' + n(other, 'fizzled'));
+    lines.push('  goals with no warning: ' + d.noWarning + ' | your deaths: ' + d.deaths);
+    var errs = d.shots.filter(function (s) { return s.outcome === 'goal'; })
+                      .map(function (s) { return s.ticks - s.warn; }).sort(function (a, b) { return a - b; });
+    if (errs.length) lines.push('  goal timing: predicted vs real, median ' + median(errs).toFixed(0) + ' ticks off (' + errs.length + ' goals)');
+    if (d.standTicks > 90) {
+      var bins = [];
+      d.stand.forEach(function (c, i) { if (c / d.standTicks >= 0.05) bins.push((i * 5) + '-' + (i * 5 + 5) + ': ' + Math.round(100 * c / d.standTicks) + '%'); });
+      lines.push('  where you stand while the ball is free (units from the left wall): ' + bins.join(', '));
+    }
+    if (d.saves.length) {
+      lines.push('  saves made from: ' + d.saves.slice(-6).map(function (v) { return 'x' + v.x.toFixed(1) + ' y' + v.y.toFixed(1); }).join(', '));
+    }
+    return lines.join('\n');
+  }
+  window.__wdbTool.track = { key: trackKey, summary: defenceSummary };
 
   // ---------------------------------------------------------------
   // Panel (the visible switch and buttons)
@@ -1032,6 +1187,8 @@
     row1.appendChild(ui.recToggle);
     row1.appendChild(makeButton('Download log', downloadLog));
     row1.appendChild(makeButton('Clear', clearLog));
+    ui.trackToggle = makeButton('', function () { state.track = !state.track; refreshPanel(); });
+    row1.appendChild(ui.trackToggle);
 
     var row2 = document.createElement('div');
     row2.appendChild(makeButton('Test: hold D 0.5s', function () { runKeyTest('right', 500); }));
@@ -1104,6 +1261,7 @@
     ui.botToggle.textContent = state.bot ? 'Bot: turn OFF' : 'Bot: turn ON';
     ui.recToggle.textContent = state.logging ? 'Record: turn OFF' : 'Record: turn ON';
     ui.target.textContent = 'Key target: ' + targetMode;
+    ui.trackToggle.textContent = 'Track defence: ' + (state.track ? 'ON' : 'off');
     ui.labTap.textContent = 'Keys held: ' + TAP_CHOICES[labSettings.tapIndex] + ' ticks';
     ui.labRun.textContent = 'Run first: ' + (labSettings.holdSideways ? 'on' : 'off');
     ui.labScan.textContent = 'Phase scan: ' + (labSettings.scan ? 'on (16 trials)' : 'off');
