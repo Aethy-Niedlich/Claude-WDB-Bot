@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WDB Tool
 // @namespace    wdb-practice-bot
-// @version      0.9.0
+// @version      0.9.1
 // @description  Practice/private rooms only. Records physics and your own key presses to a downloadable file. Sends keys ONLY when you click a Test or Lab button.
 // @homepageURL  https://github.com/Aethy-Niedlich/Claude-WDB-Bot
 // @updateURL    https://raw.githubusercontent.com/Aethy-Niedlich/Claude-WDB-Bot/main/wdb-tool.user.js
@@ -20,7 +20,7 @@
   // ---------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------
-  var VERSION = '0.9.0';
+  var VERSION = '0.9.1';
   var MODULE_NAME = 'physics/box2dweb/Box2DModuleGJMod'; // the game's physics library
   var MAX_TICKS = 120000;                                 // about 1 hour at 30 ticks/second
 
@@ -192,7 +192,7 @@
       predictorScore: scoreSummary(),
       labTrials: state.labTrials,
       moveTrials: state.moveTrials,
-      defence: { me: state.def.me, shots: state.def.shots, noWarning: state.def.noWarning, deaths: state.def.deaths, saves: state.def.saves, stand: state.def.stand }
+      defence: { me: state.def.me, shots: state.def.shots, noWarn: state.def.noWarn, deaths: state.def.deaths, deathsNear: state.def.deathsNear, saves: state.def.saves, stand: state.def.stand }
     });
     var blob = new Blob([meta + '\n' + state.lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
     var url = URL.createObjectURL(blob);
@@ -998,8 +998,10 @@
   var NET_X_LEFT = 2.0, NET_X_RIGHT = 58.9, NET_Y = 27.0;   // the ball counts as "in the net" past these lines
 
   function newDefence() {
-    return { me: null, votes: {}, shots: [], shot: null, noWarning: 0, deaths: 0, missing: 0, inNet: false,
-             stand: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], standTicks: 0, saves: [], tick: 0, keyWatch: null };
+    return { me: null, votes: {}, shots: [], shot: null, deaths: 0, deathsNear: 0, missing: 0, inNet: false,
+             noWarn: { atMine: 0, atOther: 0, mine: 0, theirs: 0, free: 0, speeds: [] },
+             stand: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], standTicks: 0, saves: [], tick: 0, keyWatch: null,
+             lastMe: null, lastBall: null };
   }
   state.def = newDefence();
 
@@ -1061,13 +1063,28 @@
     if (top >= 2 && top - next >= 2) d.me = +ranked[0];
   }
 
-  function endShot(outcome, me) {
+  // How wrong was the prediction made about half a second (15 ticks) before the goal?
+  // Positive = the ball arrived later than predicted.
+  function goalTimingError(sh, goalTick) {
+    var best = null;
+    sh.hist.forEach(function (h) {
+      var lead = goalTick - h[0];
+      if (lead >= 15 && (best === null || lead < best.lead)) best = { lead: lead, pred: h[1] };
+    });
+    return best ? best.lead - best.pred : null;
+  }
+
+  function endShot(outcome, me, ball) {
     var d = state.def, sh = d.shot;
     d.shot = null;
     var rec = { net: sh.net, mine: sh.mySide === sh.net, warn: sh.warn, outcome: outcome, ticks: d.tick - sh.start,
-                meX: sh.meX === null ? null : round3(sh.meX) };
+                meX: sh.meX === null ? null : round3(sh.meX), err: outcome === 'goal' ? goalTimingError(sh, d.tick) : null };
     d.shots.push(rec);
-    if (outcome === 'saved' && me) d.saves.push({ x: round3(me[1]), y: round3(me[2]) });
+    if (outcome === 'saved' && me && ball) {
+      var pr = predictNet(ball[1], ball[2], ball[3], ball[4], TRACK_HORIZON);   // when would it have got there, if free?
+      d.saves.push({ x: round3(me[1]), y: round3(me[2]), dist: round3(Math.hypot(me[1] - ball[1], me[2] - ball[2])),
+                     left: pr && pr.net === sh.net ? pr.ticks : null, mine: rec.mine });
+    }
   }
 
   function trackTick(bodies, joints) {
@@ -1081,7 +1098,13 @@
 
     // deaths: you vanish from the world while the ball is still there
     if (d.me !== null && ball) {
-      if (!me) { d.missing++; if (d.missing === 3) d.deaths++; } else d.missing = 0;
+      if (!me) {
+        d.missing++;
+        if (d.missing === 3) {
+          d.deaths++;
+          if (d.lastMe && d.lastBall && Math.hypot(d.lastMe[1] - d.lastBall[1], d.lastMe[2] - d.lastBall[2]) < 3.5) d.deathsNear++;
+        }
+      } else { d.missing = 0; d.lastMe = me; d.lastBall = ball; }
     }
     if (!ball) return;
 
@@ -1091,20 +1114,29 @@
     var net = ball[2] > NET_Y && (ball[1] < NET_X_LEFT || ball[1] > NET_X_RIGHT) ? (ball[1] < NET_X_LEFT ? 'left' : 'right') : null;
     if (net && !d.inNet) {                               // the ball has just gone into a net
       d.inNet = true;
-      if (d.shot) endShot('goal', me); else d.noWarning++;
+      if (d.shot) { endShot('goal', me, ball); }
+      else {                                             // nobody saw it coming: what was going on?
+        var nw = d.noWarn, mySide = me ? (me[1] < 30.4 ? 'left' : 'right') : null;
+        if (mySide === net) nw.atMine++; else nw.atOther++;
+        if (rope === null) { nw.free++; nw.speeds.push(round3(Math.hypot(ball[3], ball[4]))); }
+        else if (rope === d.me) nw.mine++; else nw.theirs++;
+      }
       return;
     }
     if (!net) d.inNet = false;
     if (net) return;
 
     if (d.shot) {
-      if (rope !== null) { endShot(rope === d.me ? 'saved' : 'grabbed by id' + rope, me); return; }
+      if (rope !== null) { endShot(rope === d.me ? 'saved' : 'grabbed by id' + rope, me, ball); return; }
       var again = predictNet(ball[1], ball[2], ball[3], ball[4], TRACK_HORIZON);
-      if (again && again.net === d.shot.net) d.shot.lost = 0;
-      else if (++d.shot.lost >= 10) endShot('fizzled', me);
+      if (again && again.net === d.shot.net) {
+        d.shot.lost = 0;
+        d.shot.hist.push([d.tick, again.ticks]);
+        if (d.shot.hist.length > 150) d.shot.hist.shift();
+      } else if (++d.shot.lost >= 10) endShot('fizzled', me, ball);
     } else if (rope === null) {
       var pr = predictNet(ball[1], ball[2], ball[3], ball[4], TRACK_HORIZON);
-      if (pr) d.shot = { net: pr.net, warn: pr.ticks, start: d.tick, lost: 0,
+      if (pr) d.shot = { net: pr.net, warn: pr.ticks, start: d.tick, lost: 0, hist: [[d.tick, pr.ticks]],
                          mySide: me ? (me[1] < 30.4 ? 'left' : 'right') : null, meX: me ? me[1] : null };
     }
   }
@@ -1113,23 +1145,46 @@
     var d = state.def;
     if (!state.track && !d.shots.length && d.me === null) return '';
     function n(arr, o) { return arr.filter(function (s) { return s.outcome === o; }).length; }
+    function others(arr) { return arr.filter(function (s) { return s.outcome.indexOf('grabbed') === 0; }).length; }
+    function pctl(arr, f) { return arr[Math.min(arr.length - 1, Math.floor(arr.length * f))]; }
     var mine = d.shots.filter(function (s) { return s.mine; });
     var other = d.shots.filter(function (s) { return !s.mine; });
     var lines = ['Defence tracker (passive, presses no keys): ' + (d.me === null ? 'I have not found you yet: press A or D for a moment' : 'you are id' + d.me)];
     lines.push('  shots at your net: ' + mine.length + ' | saved ' + n(mine, 'saved') + ', goals against ' + n(mine, 'goal') +
-               ', fizzled ' + n(mine, 'fizzled') + ', grabbed by others ' + mine.filter(function (s) { return s.outcome.indexOf('grabbed') === 0; }).length);
-    lines.push('  shots at the other net: ' + other.length + ' | goals ' + n(other, 'goal') + ', fizzled ' + n(other, 'fizzled'));
-    lines.push('  goals with no warning: ' + d.noWarning + ' | your deaths: ' + d.deaths);
-    var errs = d.shots.filter(function (s) { return s.outcome === 'goal'; })
-                      .map(function (s) { return s.ticks - s.warn; }).sort(function (a, b) { return a - b; });
-    if (errs.length) lines.push('  goal timing: predicted vs real, median ' + median(errs).toFixed(0) + ' ticks off (' + errs.length + ' goals)');
+               ', fizzled ' + n(mine, 'fizzled') + ', grabbed by others ' + others(mine));
+    lines.push('  shots at the other net: ' + other.length + ' | saved by you ' + n(other, 'saved') + ', goals ' + n(other, 'goal') +
+               ', fizzled ' + n(other, 'fizzled') + ', grabbed by others ' + others(other));
+    var nw = d.noWarn, nwTotal = nw.atMine + nw.atOther;
+    var line = '  goals with no warning: ' + nwTotal + ' (at your net ' + nw.atMine + ', at the other net ' + nw.atOther + ')';
+    if (nwTotal) {
+      line += ' | ball was on your rope ' + nw.mine + ', on someone else\'s ' + nw.theirs + ', free ' + nw.free;
+      if (nw.speeds.length) line += ' (free ones: median speed ' + median(nw.speeds.slice().sort(function (a, b) { return a - b; })).toFixed(0) + ')';
+    }
+    lines.push(line);
+    lines.push('  your deaths: ' + d.deaths + ' (while touching the ball: ' + d.deathsNear + ')');
+    var errs = d.shots.map(function (s) { return s.err; }).filter(function (e) { return e !== null && e !== undefined; })
+                      .sort(function (a, b) { return a - b; });
+    if (errs.length) {
+      lines.push('  goal timing, predicted half a second ahead: median ' + median(errs).toFixed(0) + ' ticks off (middle half ' +
+                 pctl(errs, 0.25).toFixed(0) + ' to ' + pctl(errs, 0.75).toFixed(0) + ', ' + errs.length + ' goals; positive = later than predicted)');
+    }
     if (d.standTicks > 90) {
       var bins = [];
       d.stand.forEach(function (c, i) { if (c / d.standTicks >= 0.05) bins.push((i * 5) + '-' + (i * 5 + 5) + ': ' + Math.round(100 * c / d.standTicks) + '%'); });
       lines.push('  where you stand while the ball is free (units from the left wall): ' + bins.join(', '));
     }
-    if (d.saves.length) {
-      lines.push('  saves made from: ' + d.saves.slice(-6).map(function (v) { return 'x' + v.x.toFixed(1) + ' y' + v.y.toFixed(1); }).join(', '));
+    var sv = d.saves.filter(function (v) { return v.mine; });
+    if (sv.length) {
+      function col(f) { return sv.map(f).filter(function (v) { return v !== null; }).sort(function (a, b) { return a - b; }); }
+      var xs = col(function (v) { return v.x; }), ys = col(function (v) { return v.y; }), ds = col(function (v) { return v.dist; }), ls = col(function (v) { return v.left; });
+      lines.push('  your saves (' + sv.length + '): median grab from x ' + median(xs).toFixed(1) + ', y ' + median(ys).toFixed(1) +
+                 ' (y near 38.6 = on the floor), ball ' + median(ds).toFixed(1) + ' units away' +
+                 (ls.length ? ', about ' + median(ls).toFixed(0) + ' ticks before it would reach the net' : ''));
+      var sb = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      sv.forEach(function (v) { sb[Math.min(11, Math.max(0, Math.floor(v.x / 5)))]++; });
+      var sp = [];
+      sb.forEach(function (c, i) { if (c) sp.push((i * 5) + '-' + (i * 5 + 5) + ': ' + c); });
+      lines.push('  saves by x position: ' + sp.join(', '));
     }
     return lines.join('\n');
   }
